@@ -7,6 +7,7 @@ r"""圆环零件完整测量管线（find_circles 原型）：
     python src\fit_ellipse_ring.py <图片路径>
 输出: 外圈/中心孔椭圆、6孔直径(px)；调试图 debug/fit_debug.jpg
 """
+import itertools
 import sys
 from pathlib import Path
 
@@ -26,6 +27,16 @@ INNER_CENTER_MAX_SHIFT = 0.15  # 中心孔中心相对外圈中心的容许偏�
 INNER_RATIO_TOL = 0.035       # 实测孔径比与档案真值(id_mm/od_mm)的容许偏差
 INNER_RING_HALF = 0.035       # 内圈两道边的搜索半宽（归一化半径）
 INNER_RING_MIN_GAP = 0.005    # 两道边至少差这么多（×外圈半径），否则视为同一条边
+
+# ---- 外圈回退：用紧固件锚定（只给档案显式写了 outer_fallback=bolt_anchor 的型号用）----
+BOLT_ANCHOR_NORM_WIN = 101    # 找紧固件用的局部归一化窗口（小窗口才突出孔这种小尺度结构）
+BOLT_ANCHOR_THRS = (0.55, 0.60, 0.65, 0.70)
+BOLT_ANCHOR_AREA_MIN = 300.0
+BOLT_ANCHOR_AREA_MAX = 12000.0
+BOLT_ANCHOR_DEDUP = 30.0      # 候选去重距离（px）
+BOLT_ANCHOR_RAD_TOL = 0.08    # 孔位与角度模板的半径容差（×孔圈半径）
+BOLT_ANCHOR_MIN_GRAD = 1.0    # 受约束外圈拟合的梯度门槛（圆心已定，可比自由拟合低）
+BOLT_ANCHOR_MIN_PTS = 20      # 受约束外圈拟合的最少射线数
 
 
 # ---------------- 射线亚像素边缘 ----------------
@@ -677,6 +688,120 @@ def _measure_inner_rings(prof, sm, outer):
     return out
 
 
+def _fit_circle(pts):
+    """代数最小二乘圆拟合，返回 (cx, cy, r)。3 个不共线点时即外接圆。"""
+    p = np.asarray(pts, float)
+    A = np.c_[2 * p[:, 0], 2 * p[:, 1], np.ones(len(p))]
+    b = (p ** 2).sum(axis=1)
+    sol, *_ = np.linalg.lstsq(A, b, rcond=None)
+    cx, cy, c = sol
+    return float(cx), float(cy), float(np.sqrt(max(c + cx * cx + cy * cy, 0.0)))
+
+
+def _outer_from_bolts(gray, sm, prof):
+    """外缘对比度太低时的回退：用紧固件先定圆心/朝向，再受约束地量外圈。
+
+    只给档案显式写了 `outer_fallback: "bolt_anchor"` 的型号用。思路：
+      1. 小窗口局部归一化找紧固件候选（它们比外缘对比度高得多）；
+      2. 用档案的 `bolt_angles_rel`（缺省按 bolt_count 等分）做三点定圆 + 角度模板匹配，
+         要求**声明几个孔就命中几个**，缺一个就放弃；
+      3. 由 `bolt_circle_ratio` 推出外圈期望半径，只在 ±7% 窄带里取最陡边、取中位半径。
+    外径仍然是**实测**的（不是用孔圈比例反推），所以"外径不对"仍检得出来。
+    """
+    ratio = prof.get("bolt_circle_ratio")
+    n_bolt = int(prof.get("bolt_count") or 0)
+    if not ratio or n_bolt < 3:
+        return None
+    rel = prof.get("bolt_angles_rel")
+    rel = [float(a) for a in rel] if rel else [360.0 * k / n_bolt for k in range(n_bolt)]
+    if len(rel) != n_bolt:
+        return None
+
+    # 1) 紧固件候选：小窗口归一化 + 逐档阈值
+    norm = sm / np.maximum(cv2.blur(sm, (BOLT_ANCHOR_NORM_WIN,) * 2), 1)
+    a_min, a_max = BOLT_ANCHOR_AREA_MIN, BOLT_ANCHOR_AREA_MAX
+    if prof.get("bolt_mm") and prof.get("mm_per_px"):
+        d_exp = float(prof["bolt_mm"]) / float(prof["mm_per_px"])
+        a_min = max(a_min, 0.07 * np.pi * d_exp * d_exp)    # ≈(0.3d)²π/4
+        a_max = min(a_max, 2.3 * np.pi * d_exp * d_exp)     # ≈(3.0d)²π/4
+    cands = []
+    for thr in BOLT_ANCHOR_THRS:
+        dark = (norm < thr).astype(np.uint8) * 255
+        cnts, _ = cv2.findContours(dark, cv2.RETR_LIST, cv2.CHAIN_APPROX_NONE)
+        for c in cnts:
+            a = cv2.contourArea(c)
+            if not (a_min <= a <= a_max):
+                continue
+            per = cv2.arcLength(c, True)
+            if per <= 0 or 4 * np.pi * a / (per * per) < 0.45:
+                continue
+            (x, y), _ = cv2.minEnclosingCircle(c)
+            if any(np.hypot(x - px, y - py) < BOLT_ANCHOR_DEDUP for px, py in cands):
+                continue
+            cands.append((float(x), float(y)))
+    if not (n_bolt <= len(cands) <= 40):
+        return None
+
+    # 2) 三点定圆 + 已知角度模板匹配（逐个锚相位）
+    best = None
+    for tri in itertools.combinations(range(len(cands)), 3):
+        cx, cy, R = _fit_circle([cands[i] for i in tri])
+        if not (0 < R < 0.55 * min(gray.shape)):
+            continue
+        for anchor in range(n_bolt):
+            ph = (np.arctan2(cands[tri[0]][1] - cy, cands[tri[0]][0] - cx)
+                  - np.deg2rad(rel[anchor]))
+            picks, dists, ok = [], [], True
+            for rk in rel:
+                ex = cx + R * np.cos(ph + np.deg2rad(rk))
+                ey = cy + R * np.sin(ph + np.deg2rad(rk))
+                dd = [np.hypot(x - ex, y - ey) for x, y in cands]
+                j = int(np.argmin(dd))
+                if dd[j] > max(BOLT_ANCHOR_RAD_TOL * R, 12.0):
+                    ok = False
+                    break
+                picks.append(j)
+                dists.append(dd[j])
+            if ok and len(set(picks)) == n_bolt:
+                score = float(np.mean(dists))
+                if best is None or score < best[0]:
+                    best = (score, picks)
+    if best is None:
+        return None
+
+    # 3) 用命中的 n 个孔重新拟合孔圈，再受约束地量外圈
+    cx, cy, R = _fit_circle([cands[j] for j in best[1]])
+    r_exp = R / float(ratio)
+    pts = []
+    for k in range(N_RAY):
+        ang = 2 * np.pi * k / N_RAY
+        d, g = ray_profile(sm, cx, cy, ang, r_exp * 1.10)
+        m = (d >= r_exp * 0.93) & (d <= r_exp * 1.07)
+        if m.sum() < 8:
+            continue
+        dd, gg = d[m], g[m]
+        gr = np.gradient(gg)
+        j = int(np.argmax(np.abs(gr)))
+        if abs(gr[j]) < BOLT_ANCHOR_MIN_GRAD:
+            continue
+        j = min(max(j, 1), len(gr) - 2)
+        a, b, c = gr[j - 1], gr[j], gr[j + 1]
+        den = a - 2 * b + c
+        delta = 0.5 * (a - c) / den if den != 0 else 0.0
+        r = dd[j] + np.clip(delta, -1.0, 1.0) * 0.5      # 采样步长 0.5px
+        pts.append((cx + np.cos(ang) * r, cy + np.sin(ang) * r))
+    if len(pts) < BOLT_ANCHOR_MIN_PTS:
+        return None
+    p = np.asarray(pts)
+    rad = np.hypot(p[:, 0] - cx, p[:, 1] - cy)
+    med = float(np.median(rad))
+    keep = np.abs(rad - med) <= max(3.0, 0.03 * med)
+    if keep.sum() >= BOLT_ANCHOR_MIN_PTS:
+        rad = rad[keep]
+    r_out = float(np.median(rad))
+    return ((cx, cy), (2 * r_out, 2 * r_out), 0.0), int(len(rad))
+
+
 # ---------------- 型号档案驱动的螺栓孔（装好紧固件的暗芯圆孔） ----------------
 
 def core_cross_points(gray, x, y, r_lo, r_hi, n_ray=48, frac=0.5):
@@ -1132,21 +1257,28 @@ def detect(img, init_c=None, init_r=None, profile=None):
         bolts_locate / bolts_boundary: 实际用到的策略名
         bolts_unverified: 是否走了兜底（缺档案或不完整）
         outer_fail: 外圈失败原因（None | "out_of_frame" | "not_found"），供调用方给具体提示
+        outer_src: "rays"=常规射线拟合；"bolts"=外缘对比度低、由紧固件锚定
     """
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
     h, w = gray.shape
+    prof = profile or {}
 
     # ---- 外圈: 旧先验优先(保基线)，不行再自适应定位 ----
     found, sm, outer_fail = find_outer(gray, init_c, init_r)
+    outer_src = "rays"
+    # 型号档案显式开启时才走紧固件锚定回退；正常图根本进不来
+    if found is None and prof.get("outer_fallback") == "bolt_anchor":
+        got = _outer_from_bolts(gray, sm, prof)
+        if got is not None:
+            found, outer_src, outer_fail = got, "bolts", None
     if found is None:
         return {"outer": None, "center_hole": None, "bolts": [], "inner_rings": [],
                 "bolts_locate": None, "bolts_boundary": None, "bolts_unverified": True,
-                "outer_fail": outer_fail}
+                "outer_fail": outer_fail, "outer_src": outer_src}
     outer, n_o = found
     (ocx, ocy), (oa1, oa2), oang = outer
 
     # ---- 中心孔: 自适应波段（旧档位排第一保基线）+ 真值孔径比约束 ----
-    prof = profile or {}
     r_outer = (oa1 + oa2) / 4
     # 档案同时给了 id_mm / od_mm 才用真值；无中心孔的型号不参与
     id_ratio = None
@@ -1207,7 +1339,8 @@ def detect(img, init_c=None, init_r=None, profile=None):
     return {"outer": (outer, n_o), "center_hole": (hole, n_h), "bolts": bolts,
             "inner_rings": inner_rings,
             "bolts_locate": locate_name, "bolts_boundary": boundary_name,
-            "bolts_unverified": unverified, "outer_fail": None}
+            "bolts_unverified": unverified, "outer_fail": None,
+            "outer_src": outer_src}
 
 
 def main(p: Path):

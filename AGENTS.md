@@ -62,11 +62,14 @@
 
 ```bash
 venv\Scripts\python.exe src\measure_ring.py --profile 型号1-6孔圆环 --image ..\data\captures\capture_20260908_115557.jpg
-venv\Scripts\python.exe src\measure_ring.py --profile 型号2-4孔圆盘 --image data\captures\capture_single_20261007_203729.jpg
+venv\Scripts\python.exe src\measure_ring.py --profile 型号2-4孔圆盘 --mm-per-px 0.04836640294230451 --image data\captures\capture_single_20261007_203729.jpg
 ```
 
 **必须显式带 `--profile`**：指纹会随机位/光照重建，回归门不能依赖自动识别
 （2026-10-22 换机位重建指纹后，不带档案就认不出旧夹具了，中心孔会退回旧逻辑）。
+
+**用例2 还要钉住 `--mm-per-px`**：`dark_core` 用 `bolt_mm/mm_per_px` 定搜索带，
+重标系数会连带改孔 px；钉住后 px 才是纯检测信号。
 
 **一条用例 = 一张参考图 + 它对应的档案**（不是"一个型号一条"：同型号换机位再拍一张，像素读数就变）。
 两条用例覆盖**两条互不相干的检测路径**（`template_ngon`+`countersink_rim` / `profile_angles`+`dark_core`），
@@ -144,6 +147,11 @@ venv\Scripts\python.exe src\measure_ring.py --profile 型号2-4孔圆盘 --image
   - **外圈出画时不许锁到内孔**：`find_outer` 接受候选后会检查外面是否还有"更大且同心"的圆；
     有、且它出画，就返回 `out_of_frame`。内孔是完美圆，`_outer_ok` 的三条判据全过，
     只有这一条能揭穿它。守卫只在自适应路径生效（旧先验命中时 peaks 为空、不付开销）。
+  - **外缘对比度太低时**：只有档案写了 `outer_fallback: "bolt_anchor"` 的型号才启用
+    `_outer_from_bolts`——先用紧固件定圆心/朝向、按 `bolt_circle_ratio` 推期望半径，
+    再在 ±7% 窄带里**实测**外径（不能用孔圈比例反推，否则"外径不对"就检不出来）。只在
+    `find_outer` 失败时触发，正常图不进；报告/GUI 必须标「由紧固件锚定」。自动识别用不了
+    这条路（那时还不知道型号）。
   - `detect(img, init_c, init_r, profile)` → `{"outer","center_hole","bolts","bolts_locate",
     "bolts_boundary","bolts_unverified"}`。
   - **外圈定位是自适应的**：`_outer_candidates` 给候选（旧先验排第一保基线，之后是
@@ -179,6 +187,7 @@ venv\Scripts\python.exe src\measure_ring.py --profile 型号2-4孔圆盘 --image
 - **型号档案是唯一入口**：`models/part_profiles.json`。字段：`od_mm` / `id_mm` /
   `has_center_hole` / `bolt_mm` / `bolt_count` / `bolt_angles_rel`（相对角度，支持非等分）/
   `bolt_circle_ratio` / `inner_rings`（`[{name, mm}]`，按两道边中点测）/
+  `outer_fallback`（可选 `bolt_anchor`，见下）/
   `locate` / `boundary` / `mm_per_px` / `fingerprint_src`。
 - **型号识别 = 外圈环带的极坐标指纹**（`polar_fingerprint` / `match_fingerprint`）。不传
   `--profile` 时：`find_outer` → 环带按归一化半径展开 → 与各型号指纹做**沿角度的循环互相关** →

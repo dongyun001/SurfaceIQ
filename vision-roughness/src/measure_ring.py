@@ -372,6 +372,11 @@ def measure(img: np.ndarray, args) -> RingResult:
             profile = named_profile(profiles, name)
             ident = f"自动识别型号「{name}」（{why}）"
             ident_source = IDENT_AUTO
+    # --mm-per-px 是"本次测量用这个系数"，检测里用到系数的路径（如 dark_core 的搜索带）
+    # 也必须跟着走，否则报告和检测会用两套比例。回归门靠它把系数钉死。
+    if args.mm_per_px and profile:
+        profile = dict(profile)
+        profile["mm_per_px"] = float(args.mm_per_px)
     res = detect(img, profile=profile)
     if res["outer"] is None:
         raise MeasureError(_outer_fail_message(img, res.get("outer_fail")))
@@ -428,6 +433,9 @@ def measure(img: np.ndarray, args) -> RingResult:
     else:
         _p(f"换算系数: {ratio:.6f} mm/px （来源: {ratio_src}）")
     _p(_size_line("外径:  ", od_mm, outer_dia_px, oa1, oa2, oang))
+    if res.get("outer_src") == "bolts":
+        _p("        （外缘对比度低：圆心/搜索半径由紧固件锚定，外径仍为实测）")
+        warnings.append("外圈由紧固件锚定（外缘对比度低）")
 
     tilt = max(oa1, oa2) / min(oa1, oa2)
     if tilt > 1.02:
