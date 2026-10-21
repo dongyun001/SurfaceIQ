@@ -21,6 +21,7 @@ OUTER_AXIS_RATIO_MAX = 1.8   # 外圈长短轴比上限（斜视视角的物理�
 OUTER_MAX_CANDIDATES = 60    # 候选上限，防自适应搜索跑飞
 OUTER_CENTER_MIN_RATIO = 0.5  # 圆心最强径向峰 < 全局最强峰×此比例就丢弃（零件不在这儿）
 INNER_CENTER_MAX_SHIFT = 0.15  # 中心孔中心相对外圈中心的容许偏移（×外圈半径）
+INNER_RATIO_TOL = 0.035       # 实测孔径比与档案真值(id_mm/od_mm)的容许偏差
 
 
 # ---------------- 射线亚像素边缘 ----------------
@@ -515,7 +516,7 @@ def _outer_ok(ell, n, w, h):
     return (cx - s >= 0) and (cx + s <= w) and (cy - s >= 0) and (cy + s <= h)
 
 
-def _inner_candidates(r_outer):
+def _inner_candidates(r_outer, id_ratio=None):
     """中心孔候选 (lo, hi, r0, polarity)，**旧档位排第一保基线**。
 
     老代码写死"中心孔半径 = 外圈的 0.60~0.78 倍"——换个孔径比不同的型号就测不到
@@ -525,11 +526,27 @@ def _inner_candidates(r_outer):
 
     r0 单独给、不取波段中点：老代码那一档用的是 0.70（而不是 0.60~0.78 的中点 0.69），
     圆等价滤点边界跟着 r0 走，差这一点读数就会变——基线回归门就是靠这个抓出来的。
+
+    档案给了真值孔径比（id_mm/od_mm）时，**先**给一组以它为中心的窄带候选（±1.5%，
+    中心再 ±2% 扫一遍），每条射线在带内取**最陡梯度**。型号1 内圈实测有三圈
+    （≈55.9 / ~60 / ~78mm），窄带保证每次只框住最内侧那一圈，不会把它们平均成一条。
+    **不要改成"取缓坡最内侧像素"**：孔壁边缘是约 0.02r 宽的缓坡，取坡脚会随窗口位置漂
+    （实测 0.620~0.629），最陡梯度才稳定在 0.630。
+    调用方再在"实测比落在真值容差内"的候选里挑最接近真值的一个。原来那组候选
+    原样保留作兜底——没有真值孔径比的型号走它，行为与以前一致。
     """
+    if id_ratio:
+        for dr in (-0.02, -0.01, 0.0, 0.01, 0.02):
+            r0 = id_ratio + dr
+            for pol in (+1, -1):
+                yield (r_outer * (r0 - 0.015), r_outer * (r0 + 0.015),
+                       r_outer * r0, pol)
+    # ---- 兜底：老档位与自适应波段（保持原样，r0 必须严格 0.70）----
     yield r_outer * 0.60, r_outer * 0.78, r_outer * 0.70, +1
     for f_lo, f_hi in [(0.20, 0.36), (0.33, 0.50), (0.46, 0.64), (0.74, 0.92)]:
         for pol in (+1, -1):
-            yield r_outer * f_lo, r_outer * f_hi, r_outer * (f_lo + f_hi) / 2, pol
+            yield (r_outer * f_lo, r_outer * f_hi,
+                   r_outer * (f_lo + f_hi) / 2, pol)
     yield r_outer * 0.60, r_outer * 0.78, r_outer * 0.70, -1
 
 
@@ -983,25 +1000,37 @@ def detect(img, init_c=None, init_r=None, profile=None):
     outer, n_o = found
     (ocx, ocy), (oa1, oa2), oang = outer
 
-    # ---- 中心孔: 外圈内暗->亮的上升沿 ----
-    # ---- 中心孔: 自适应波段（旧档位排第一保基线）----
+    # ---- 中心孔: 自适应波段（旧档位排第一保基线）+ 真值孔径比约束 ----
+    prof = profile or {}
     r_outer = (oa1 + oa2) / 4
+    # 档案同时给了 id_mm / od_mm 才用真值；无中心孔的型号不参与
+    id_ratio = None
+    if (prof.get("id_mm") and prof.get("od_mm")
+            and prof.get("has_center_hole") is not False):
+        id_ratio = float(prof["id_mm"]) / float(prof["od_mm"])
     hole = n_h = None
-    for (lo, hi, r0, pol) in _inner_candidates(r_outer):
+    best_inner = None
+    for (lo, hi, r0, pol) in _inner_candidates(r_outer, id_ratio):
+        # 带内取最陡梯度（不要取缓坡坡脚，那会随窗口位置漂）
         pts_h = find_edge_points(sm, ocx, ocy, lo, hi, pol, 1.2, n_ray=N_RAY)
         ell, n = filter_and_fit(pts_h, ocx, ocy, r0)
-        if ell is None:
+        if ell is None or not _inner_ok(ell, n, outer):
             continue
-        if _inner_ok(ell, n, outer):
+        if id_ratio is None:
             hole, n_h = ell, n
             break
+        # 有真值：在"实测孔径比落在容差内"的候选里挑最接近真值的那条
+        diff = abs((ell[1][0] + ell[1][1]) / 4 / r_outer - id_ratio)
+        if diff <= INNER_RATIO_TOL and (best_inner is None or diff < best_inner[0]):
+            best_inner = (diff, ell, n)
+    if best_inner is not None:
+        hole, n_h = best_inner[1], best_inner[2]
     if hole is None:
         hcx, hcy, ha1, ha2, hang = ocx, ocy, 0.0, 0.0, 0.0
     else:
         (hcx, hcy), (ha1, ha2), hang = hole
 
     # ---- 螺栓孔: locate(怎么定位孔) + boundary(量哪条边界) 两个维度派发 ----
-    prof = profile or {}
     norm = sm / np.maximum(cv2.blur(sm, (201, 201)), 1)
     ctx = {"sm": sm, "sm2": None, "gray": gray, "norm": norm,
            "outer": outer, "hole": (hole, n_h), "w": w, "h": h}
