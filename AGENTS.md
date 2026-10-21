@@ -61,9 +61,12 @@
 **下面两条都要跑**（cwd 一律 `vision-roughness/`）：
 
 ```bash
-venv\Scripts\python.exe src\measure_ring.py --image ..\data\captures\capture_20260908_115557.jpg
-venv\Scripts\python.exe src\measure_ring.py --image data\captures\capture_single_20261007_203729.jpg
+venv\Scripts\python.exe src\measure_ring.py --profile 型号1-6孔圆环 --image ..\data\captures\capture_20260908_115557.jpg
+venv\Scripts\python.exe src\measure_ring.py --profile 型号2-4孔圆盘 --image data\captures\capture_single_20261007_203729.jpg
 ```
+
+**必须显式带 `--profile`**：指纹会随机位/光照重建，回归门不能依赖自动识别
+（2026-10-22 换机位重建指纹后，不带档案就认不出旧夹具了，中心孔会退回旧逻辑）。
 
 **一条用例 = 一张参考图 + 它对应的档案**（不是"一个型号一条"：同型号换机位再拍一张，像素读数就变）。
 两条用例覆盖**两条互不相干的检测路径**（`template_ngon`+`countersink_rim` / `profile_angles`+`dark_core`），
@@ -129,7 +132,8 @@ venv\Scripts\python.exe src\measure_ring.py --image data\captures\capture_single
 
 - **换相机 / 曝光 / 增益**：只改 `src/config.py` 的 `CAMERA_TYPE` + `CAMERA_KWARGS`——
   这是换相机的唯一改动点，业务代码不许动。曝光默认自动标定（开机二分几帧把亮度调到
-  `auto_target`，**开机因此多等 1~3 秒**；要严格复现历史读数就 `auto_exposure=False`）。
+  `auto_target`，再按削顶占比 `auto_sat_max` 往下收一点——**亮金属过曝会让边缘往内偏**，
+  实测孔壁比 0.630→0.618；**开机因此多等几秒**；要严格复现历史读数就 `auto_exposure=False`）。
 - **相机接入抽象层**：`src/camera_adapter.py`（`webcam` / `file` / `hikvision` 三实现，
   工厂函数 `create_camera()`），海康 DLL 搜索路径由它自动补。
 - **检测管线核心**：`src/fit_ellipse_ring.py`。几何算法都改这里。
