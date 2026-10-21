@@ -133,8 +133,13 @@ venv\Scripts\python.exe src\measure_ring.py --image data\captures\capture_single
 - **相机接入抽象层**：`src/camera_adapter.py`（`webcam` / `file` / `hikvision` 三实现，
   工厂函数 `create_camera()`），海康 DLL 搜索路径由它自动补。
 - **检测管线核心**：`src/fit_ellipse_ring.py`。几何算法都改这里。
-  - `find_outer(gray, init_c, init_r)` → `((椭圆, 点数) | None, σ=5 模糊图)`：外圈定位，
-    **识别与检测共用**（识别也要外圈椭圆；识别若复用 `detect()` 会把整条螺栓孔管线白跑一遍）。
+  - `find_outer(gray, init_c, init_r)` → `((椭圆, 点数) | None, σ=5 模糊图, 失败原因)`：
+    外圈定位，**识别与检测共用**（识别也要外圈椭圆；识别若复用 `detect()` 会把整条螺栓孔
+    管线白跑一遍）。失败原因是 `None` | `"out_of_frame"` | `"not_found"`，调用方据此给
+    具体提示，别退回笼统的「外圈拟合失败」。
+  - **外圈出画时不许锁到内孔**：`find_outer` 接受候选后会检查外面是否还有"更大且同心"的圆；
+    有、且它出画，就返回 `out_of_frame`。内孔是完美圆，`_outer_ok` 的三条判据全过，
+    只有这一条能揭穿它。守卫只在自适应路径生效（旧先验命中时 peaks 为空、不付开销）。
   - `detect(img, init_c, init_r, profile)` → `{"outer","center_hole","bolts","bolts_locate",
     "bolts_boundary","bolts_unverified"}`。
   - **外圈定位是自适应的**：`_outer_candidates` 给候选（旧先验排第一保基线，之后是

@@ -20,6 +20,8 @@ OUTER_COVER_MIN = 0.6        # 保留点数 ≥ 射线数×此比例（误锁只
 OUTER_AXIS_RATIO_MAX = 1.8   # 外圈长短轴比上限（斜视视角的物理上限）
 OUTER_MAX_CANDIDATES = 60    # 候选上限，防自适应搜索跑飞
 OUTER_CENTER_MIN_RATIO = 0.5  # 圆心最强径向峰 < 全局最强峰×此比例就丢弃（零件不在这儿）
+OUTER_OUT_OF_FRAME_RATIO = 0.92  # 检出圆 < 更大同心圆的此比例 => 零件出画、检出的是内孔
+OUTER_CONCENTRIC_TOL = 0.15      # 判"同心"的圆心偏移上限（×检出半径）
 INNER_CENTER_MAX_SHIFT = 0.15  # 中心孔中心相对外圈中心的容许偏移（×外圈半径）
 INNER_RATIO_TOL = 0.035       # 实测孔径比与档案真值(id_mm/od_mm)的容许偏差
 
@@ -455,8 +457,12 @@ def _radial_peaks(ey, ex, cx, cy, r_min, r_max, top=6, bin_px=2.0, merge_ratio=0
     return out
 
 
-def _outer_candidates(gray, w, h, cx0, cy0, init_r):
+def _outer_candidates(gray, w, h, cx0, cy0, init_r, peaks_out=None):
     """外圈候选 (cx, cy, r0, polarity)，**旧先验排最前以保证基线读数不变**。
+
+    `peaks_out` 非 None 时，把自适应阶段的径向峰 `(count, radius)` 填进去——
+    `find_outer` 用它检查"外面是否还有更大的同心圆"（缺陷 8）。快速路径命中时
+    生成器根本走不到这里，所以旧先验那张图不会有任何额外开销。
 
     历史先验只假设了"零件在画面正中 + 外圈半径 ≈ 短边的 44% + 边缘是亮→暗"，
     零件一挪位置/换型号就全废。数据驱动的候选由
@@ -493,6 +499,8 @@ def _outer_candidates(gray, w, h, cx0, cy0, init_r):
     for (ccx, ccy), peaks in per_center:
         if peaks[0][0] < strongest * OUTER_CENTER_MIN_RATIO:
             continue
+        if peaks_out is not None:
+            peaks_out.extend(peaks)
         for _, r in peaks:
             for pol in (-1, +1):
                 n += 1
@@ -518,21 +526,29 @@ def _refine_outer(sm, ell, n, pol):
     return (ell2, n2) if ell2 is not None else (ell, n)
 
 
-def _outer_ok(ell, n, w, h):
-    """外圈候选是否可信：点数够 + 轴比合理 + 不出画幅。
+def _outer_shape_ok(ell, n):
+    """外圈候选的形状判据：点数够 + 轴比合理（**不看画幅**，出画另判）。
 
     **残差 RMS 不能当门槛**：实测基线自身就有 41px、错误极性在标定图上也有 41px
-    （斜视外缘本身是个有厚度的带，不是一条线），两者区分不开。点数和画幅才管用：
-    型号2 那次误锁用点只有 22/72，外接框还溢出画幅（x 到 -48、y 到 3174），
-    两条里任意一条都挡得住。
+    （斜视外缘本身是个有厚度的带，不是一条线），两者区分不开。点数才管用：
+    型号2 那次误锁用点只有 22/72。
     """
     if n < OUTER_COVER_MIN * N_RAY:
         return False
+    _, (a1, a2), _ = ell
+    return min(a1, a2) > 0 and max(a1, a2) / min(a1, a2) <= OUTER_AXIS_RATIO_MAX
+
+
+def _outer_in_frame(ell, w, h):
+    """外接框是否完整落在画幅内。"""
     (cx, cy), (a1, a2), _ = ell
-    if min(a1, a2) <= 0 or max(a1, a2) / min(a1, a2) > OUTER_AXIS_RATIO_MAX:
-        return False
     s = max(a1, a2) / 2          # 保守：按长半轴当各向外接半径
     return (cx - s >= 0) and (cx + s <= w) and (cy - s >= 0) and (cy + s <= h)
+
+
+def _outer_ok(ell, n, w, h):
+    """外圈候选是否可信：形状合格 + 不出画幅。"""
+    return _outer_shape_ok(ell, n) and _outer_in_frame(ell, w, h)
 
 
 def _inner_candidates(r_outer, id_ratio=None):
@@ -974,8 +990,38 @@ BOUNDARY_FNS = {
 }
 
 
+def _larger_concentric_out_of_frame(sm, ell, peaks, w, h):
+    """检出圆之外是否还有"更大、同心、形状合格、但出画"的圆。
+
+    用来拦住"外圈被画幅切掉、于是锁到内孔"的静默错读（缺陷 8）：内孔本身是个完美圆，
+    `_outer_ok` 的三条判据全过，只有"外面还有一圈更大的同心圆"能揭穿它。
+    只看明显更大的峰（> 检出半径 ÷ OUTER_OUT_OF_FRAME_RATIO），通常只有一两个。
+    """
+    (cx, cy), (a1, a2), _ = ell
+    r_acc = (a1 + a2) / 4
+    for _, r in peaks:
+        if r <= r_acc / OUTER_OUT_OF_FRAME_RATIO:
+            continue
+        for pol in (-1, +1):
+            e, n = _fit_outer_at(sm, cx, cy, r, pol)
+            if e is None:
+                continue
+            e, n = _refine_outer(sm, e, n, pol)
+            if not _outer_shape_ok(e, n):
+                continue
+            (ecx, ecy), _, _ = e
+            if np.hypot(ecx - cx, ecy - cy) > OUTER_CONCENTRIC_TOL * r_acc:
+                continue
+            if not _outer_in_frame(e, w, h):
+                return True
+    return False
+
+
 def find_outer(gray, init_c=None, init_r=None):
-    """外圈自适应定位，返回 ((椭圆, 保留点数) 或 None, σ=5 的模糊图)。
+    """外圈自适应定位，返回 ((椭圆, 保留点数) | None, σ=5 模糊图, 失败原因)。
+
+    失败原因：None=成功；"out_of_frame"=外面有更大的同心圆被画幅切掉（检出的只是内孔）；
+    "not_found"=没找到可信外圈。调用方据此给具体提示，不再笼统报"外圈拟合失败"。
 
     单独拿出来是因为**型号识别也要外圈椭圆**（极坐标指纹的径向基准就是它），而识别
     跑在检测之前——若复用 detect()，会把整条螺栓孔管线白跑一遍。
@@ -984,14 +1030,20 @@ def find_outer(gray, init_c=None, init_r=None):
     sm = cv2.GaussianBlur(gray, (0, 0), 5)
     # 旧先验优先(保基线)，不行再自适应定位
     cx0, cy0 = init_c or (w / 2, h / 2)
-    for (cx, cy, r0, pol) in _outer_candidates(gray, w, h, cx0, cy0, init_r):
+    peaks = []
+    for (cx, cy, r0, pol) in _outer_candidates(gray, w, h, cx0, cy0, init_r, peaks):
         ell, n = _fit_outer_at(sm, cx, cy, r0, pol)
         if ell is None:
             continue
         ell, n = _refine_outer(sm, ell, n, pol)
-        if _outer_ok(ell, n, w, h):
-            return (ell, n), sm
-    return None, sm
+        if not _outer_ok(ell, n, w, h):
+            continue
+        # 快速路径（旧先验）命中时 peaks 还是空的，这一步是空转、不付开销。
+        # 缺陷 8：内孔也是完美圆；若外面还有更大、同心的圆被画幅切掉，现在这个是内孔。
+        if _larger_concentric_out_of_frame(sm, ell, peaks, w, h):
+            return None, sm, "out_of_frame"
+        return (ell, n), sm, None
+    return None, sm, "not_found"
 
 
 def detect(img, init_c=None, init_r=None, profile=None):
@@ -1007,15 +1059,17 @@ def detect(img, init_c=None, init_r=None, profile=None):
         bolts: [{cx,cy,dia,a1,a2,status,n,src}]，src=detected/profile/synthesized
         bolts_locate / bolts_boundary: 实际用到的策略名
         bolts_unverified: 是否走了兜底（缺档案或不完整）
+        outer_fail: 外圈失败原因（None | "out_of_frame" | "not_found"），供调用方给具体提示
     """
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
     h, w = gray.shape
 
     # ---- 外圈: 旧先验优先(保基线)，不行再自适应定位 ----
-    found, sm = find_outer(gray, init_c, init_r)
+    found, sm, outer_fail = find_outer(gray, init_c, init_r)
     if found is None:
         return {"outer": None, "center_hole": None, "bolts": [],
-                "bolts_locate": None, "bolts_boundary": None, "bolts_unverified": True}
+                "bolts_locate": None, "bolts_boundary": None, "bolts_unverified": True,
+                "outer_fail": outer_fail}
     outer, n_o = found
     (ocx, ocy), (oa1, oa2), oang = outer
 
@@ -1077,7 +1131,7 @@ def detect(img, init_c=None, init_r=None, profile=None):
                       "src": s["src"], "status": "OK"})
     return {"outer": (outer, n_o), "center_hole": (hole, n_h), "bolts": bolts,
             "bolts_locate": locate_name, "bolts_boundary": boundary_name,
-            "bolts_unverified": unverified}
+            "bolts_unverified": unverified, "outer_fail": None}
 
 
 def main(p: Path):

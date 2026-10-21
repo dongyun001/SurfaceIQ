@@ -180,9 +180,9 @@ def build_fingerprint(args, img):
         )
     prof = named_profile(load_profiles(), name)
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-    found, _ = find_outer(gray)
+    found, _, outer_fail = find_outer(gray)
     if found is None:
-        raise MeasureError("参考图的外圈定位失败，无法生成指纹。" + locate_fail_hint(img))
+        raise MeasureError("无法生成指纹：" + _outer_fail_message(img, outer_fail))
     fp = polar_fingerprint(gray, found[0])
     npz, png = save_fingerprint(prof, fp, args.image or "相机现拍", img.shape[:2])
     print(f"已生成型号「{prof['_name']}」的指纹: {npz}")
@@ -322,6 +322,19 @@ def locate_fail_hint(img: np.ndarray) -> str:
     return "外圈拟合失败。检查：对焦、光照、零件是否在画面中心"
 
 
+def _outer_fail_message(img: np.ndarray, reason) -> str:
+    """外圈定位失败的具体原因。
+
+    缺陷 8：零件出画时，外圈会被画幅切掉，自适应搜索会退而锁到内孔（它是个完美圆，
+    三条判据全过）。`find_outer` 现在会把这种情况标成 out_of_frame，这里必须说清，
+    否则操作员会拿"内孔直径"当外径。
+    """
+    if reason == "out_of_frame":
+        return ("外圈超出画面：检出的是内孔（更外面的圆被画幅切掉了）。\n"
+                "把零件移入画面中心，或把相机抬高/后拉，让整圈外缘都在画面内再测。")
+    return locate_fail_hint(img)
+
+
 def measure(img: np.ndarray, args) -> RingResult:
     """检测 → 换算 → 判定 → 落盘（调试图 + 文字报告），返回结构化结果。
 
@@ -344,9 +357,9 @@ def measure(img: np.ndarray, args) -> RingResult:
         # **自动识别**：只用外圈椭圆算极坐标指纹（归一化展开 + 标准化，全无量纲，
         # 所以不需要 mm/px，不会和"按型号存系数"循环依赖）。
         gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-        found, _ = find_outer(gray)
+        found, _, outer_fail = find_outer(gray)
         if found is None:
-            raise MeasureError(locate_fail_hint(img))
+            raise MeasureError(_outer_fail_message(img, outer_fail))
         fingerprints, fp_missing = load_fingerprints(profiles)
         name, why = match_fingerprint(polar_fingerprint(gray, found[0]), fingerprints)
         if name is None:
@@ -360,7 +373,7 @@ def measure(img: np.ndarray, args) -> RingResult:
             ident_source = IDENT_AUTO
     res = detect(img, profile=profile)
     if res["outer"] is None:
-        raise MeasureError(locate_fail_hint(img))
+        raise MeasureError(_outer_fail_message(img, res.get("outer_fail")))
 
     lines: list = []
     warnings: list = []
