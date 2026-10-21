@@ -116,11 +116,12 @@ def from_norm(nx, ny, ocx, ocy, oa1, oa2, oang):
 
 # ---------------- 螺栓孔: 模板匹配 + 等角共圆校验 ----------------
 
-def rough_templates(sm, band, min_area=3000):
-    """环带内粗找暗连通域，按圆度x面积选最像孔的区域做模板。"""
-    bg = cv2.blur(sm, (201, 201))
-    norm = sm / np.maximum(bg, 1)
-    dark = cv2.bitwise_and(((norm < 0.62).astype(np.uint8) * 255), band)
+ROUGH_DARK_THRS = (0.62, 0.70, 0.74)  # 沉孔可能被光打亮：0.62 找不到才逐级放宽
+
+
+def _best_dark_blob(norm, band, thr, min_area=3000):
+    """在 band 内按 norm<thr 找面积够、够圆的暗连通域，返回 (score, contour) 或 None。"""
+    dark = cv2.bitwise_and(((norm < thr).astype(np.uint8) * 255), band)
     cnts, _ = cv2.findContours(dark, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
     best = None
     for c in cnts:
@@ -134,6 +135,24 @@ def rough_templates(sm, band, min_area=3000):
         score = circ * np.sqrt(a)
         if best is None or score > best[0]:
             best = (score, c)
+    return best
+
+
+def rough_templates(sm, band, min_area=3000):
+    """环带内粗找暗连通域，按圆度x面积选最像孔的区域做模板。
+
+    阈值从前写死 0.62。换机位/光照后沉孔可能只比周围暗 25~30%（norm≈0.7），
+    0.62 下会被螺钉头高光切成碎块、圆度不够 → 模板为 None → 螺栓孔一个都测不到
+    （2026-10-21 实拍：0.62/0.66 达标暗斑 0 个，0.70 起才有）。所以按
+    `ROUGH_DARK_THRS` 逐级放宽；**先试 0.62**，保证原有图（含两条回归用例）逐字符不变。
+    """
+    bg = cv2.blur(sm, (201, 201))
+    norm = sm / np.maximum(bg, 1)
+    best = None
+    for thr in ROUGH_DARK_THRS:
+        best = _best_dark_blob(norm, band, thr, min_area)
+        if best is not None:
+            break
     if best is None:
         return None
     x, y, w2, h2 = cv2.boundingRect(best[1])
