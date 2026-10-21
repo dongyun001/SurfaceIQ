@@ -15,6 +15,14 @@ from pathlib import Path
 import cv2
 import numpy as np
 
+# ---- 自动曝光的高光约束 ----
+# 亮金属被 255 削顶会把边缘位置往内推：同一零件、只改曝光，8~32ms 孔壁比稳定在
+# 0.630，105ms（亮环整片顶到 255）掉到 0.618。所以按均值标定完还要压一下削顶占比；
+# 但压得太狠会把画面弄暗、检测先坏，所以同时有均值下限。
+AUTO_SAT_LEVEL = 250      # 视为"削顶"的灰度阈值
+AUTO_MIN_MEAN = 40.0      # 为压高光最多把均值降到这儿（再低就得不偿失）
+AUTO_SAT_STEPS = 5        # 最多往下收几档（每档 ×0.75）
+
 
 def _add_mvs_runtime_to_dll_path():
     """把 MVS 运行时 DLL 目录补进 DLL 搜索路径。
@@ -149,6 +157,7 @@ class HikvisionCamera(BaseCamera):
     def __init__(self, sdk_path: str = None, exposure_us: float = None,
                  gain: float = None, auto_exposure: bool = True,
                  auto_target: float = 110.0, auto_max_us: float = 200000.0,
+                 auto_sat_max: float = 0.01,
                  timeout_ms: int = 3000, packet_size=1500):
         self._timeout_ms = timeout_ms
         self._packet_size = packet_size
@@ -157,6 +166,7 @@ class HikvisionCamera(BaseCamera):
         self._auto_exposure = auto_exposure
         self._auto_target = auto_target
         self._auto_max_us = auto_max_us
+        self._auto_sat_max = float(auto_sat_max)
         self.exposure_us = exposure_us          # 最终生效值（自动标定后会更新）
         self._mv = self._import_sdk(sdk_path or self.DEFAULT_SDK_PATH)
         self._open(exposure_us, gain)
@@ -238,15 +248,16 @@ class HikvisionCamera(BaseCamera):
                     "设置曝光时间")
         self.exposure_us = float(exposure_us)
 
-    def _grab_mean(self, settle: int = 2) -> float:
-        """取一帧的平均亮度；先丢 settle 帧，等新曝光值真正生效。
+    def _grab_stats(self, settle: int = 2):
+        """取一帧，返回 (平均亮度, 削顶像素占比)；先丢 settle 帧等新曝光值生效。
 
         改完曝光，流里还在传改之前那一帧；不丢帧就会把旧亮度当成新亮度的结果，
         二分搜索会被带偏。
         """
         for _ in range(settle):
             self.capture()
-        return float(self.capture().mean())
+        g = self.capture()
+        return float(g.mean()), float((g >= AUTO_SAT_LEVEL).mean())
 
     def _calibrate_exposure(self, iters: int = 6):
         """按现场亮度自动标定曝光，标定完即锁定（auto_exposure=True 时开机跑一次）。
@@ -255,10 +266,15 @@ class HikvisionCamera(BaseCamera):
         这比"亮度漂移"严重得多。标定只跑一次，之后曝光值固定，同一次开机内读数
         仍可复现。
 
-        按**对数**二分：可用曝光跨度有 3 个数量级（0.2ms~200ms），线性二分在暗端
-        分辨率会低到没用。只用手动曝光通道（ExposureAuto=0 + ExposureTime，两者
-        本机型已验证可用），不依赖 Brightness / AutoExposureTime* / ExposureAuto=Once
-        这些各机型命名不一的节点，免得出错在节点名上反而把相机弄成打不开。
+        两步：
+        1. 按**对数**二分把画面均值调到 `auto_target`（可用跨度 0.2~200ms，线性二分
+           在暗端分辨率不够）。只用手动曝光通道（ExposureAuto=0 + ExposureTime，
+           本机型已验证可用），不依赖 Brightness / AutoExposureTime* / ExposureAuto=Once
+           这些各机型命名不一的节点，免得出错在节点名上反而把相机弄成打不开。
+        2. **高光兜底**：削顶像素（≥`AUTO_SAT_LEVEL`）超过 `auto_sat_max` 时，按 0.75 倍
+           往下收曝光。亮金属削顶会移动边缘位置（实测孔壁比 0.630→0.618）；但最多收
+           `AUTO_SAT_STEPS` 档，且均值不得低于 `AUTO_MIN_MEAN`——再低画面就太暗，
+           检测会先坏，那种情况宁可保留一点高光并明确告警。
         """
         lo, hi = np.log(200.0), np.log(float(self._auto_max_us))
         target = float(self._auto_target)
@@ -266,7 +282,7 @@ class HikvisionCamera(BaseCamera):
         for _ in range(iters):
             us = float(np.exp((lo + hi) / 2))
             self._set_exposure(us)
-            mean = self._grab_mean()
+            mean, _ = self._grab_stats()
             if best is None or abs(mean - target) < best[0]:
                 best = (abs(mean - target), us, mean)
             if mean < target:       # 太暗 -> 加曝光
@@ -279,8 +295,30 @@ class HikvisionCamera(BaseCamera):
         dark = best[2] < target * 0.9
         chosen = float(self._auto_max_us) if dark else best[1]
         self._set_exposure(chosen)
+        mean, sat = self._grab_stats()
+
+        # ---- 高光削顶兜底 ----
+        for _ in range(AUTO_SAT_STEPS):
+            if sat <= self._auto_sat_max:
+                break
+            nxt = max(self.exposure_us * 0.75, 200.0)
+            if nxt >= self.exposure_us:
+                break
+            prev = (self.exposure_us, mean, sat)
+            self._set_exposure(nxt)
+            m2, s2 = self._grab_stats()
+            if m2 < AUTO_MIN_MEAN:      # 再收就太暗 -> 回退，保留一点高光
+                self._set_exposure(prev[0])
+                mean, sat = prev[1], prev[2]
+                break
+            mean, sat = m2, s2
+
         warn = "  ⚠️ 现场偏暗，已顶到曝光上限，考虑补光" if dark else ""
-        print(f"[hikvision] 自动曝光: {chosen:.0f}us（实测亮度 {best[2]:.1f}，目标 {target:.0f}）{warn}")
+        if sat > self._auto_sat_max:
+            warn += (f"  ⚠️ 仍有 {sat * 100:.1f}% 高光削顶（≥{AUTO_SAT_LEVEL}）："
+                     "亮金属过曝会让边缘内偏，考虑补光/减弱直射反光")
+        print(f"[hikvision] 自动曝光: {self.exposure_us:.0f}us"
+              f"（均值 {mean:.1f}，目标 {target:.0f}；削顶 {sat * 100:.2f}%）{warn}")
 
     def _try_open_one(self, device_list, idx, exposure_us, gain):
         """打开指定枚举项、配置参数、开始采集并试取一帧；失败抛异常并清理。"""
