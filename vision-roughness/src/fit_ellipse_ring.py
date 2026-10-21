@@ -121,14 +121,23 @@ def from_norm(nx, ny, ocx, ocy, oa1, oa2, oang):
 ROUGH_DARK_THRS = (0.62, 0.70, 0.74)  # 沉孔可能被光打亮：0.62 找不到才逐级放宽
 
 
-def _best_dark_blob(norm, band, thr, min_area=3000):
-    """在 band 内按 norm<thr 找面积够、够圆的暗连通域，返回 (score, contour) 或 None。"""
+def _best_dark_blob(norm, band, thr, min_area=3000, max_side=None):
+    """在 band 内按 norm<thr 找面积够、够圆、且**不像整圈暗槽**的暗连通域。
+
+    **必须用 RETR_LIST**：环面上的暗槽会连成闭合的环，`RETR_EXTERNAL` 只返回最外层
+    轮廓，环里面那 6 个沉孔会被当成"洞"整个丢掉（2026-10-22 实测：所有阈值下都只有
+    一个 419 万 px 的环形轮廓，沉孔一个都出不来）。
+    max_side：外接框长边上限（px）。孔不可能跟环带一个量级，用来把环形暗槽本身挡掉。
+    """
     dark = cv2.bitwise_and(((norm < thr).astype(np.uint8) * 255), band)
-    cnts, _ = cv2.findContours(dark, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
+    cnts, _ = cv2.findContours(dark, cv2.RETR_LIST, cv2.CHAIN_APPROX_NONE)
     best = None
     for c in cnts:
         a = cv2.contourArea(c)
         if a < min_area:
+            continue
+        x, y, w2, h2 = cv2.boundingRect(c)
+        if max_side is not None and max(w2, h2) > max_side:
             continue
         per = cv2.arcLength(c, True)
         circ = 4 * np.pi * a / (per * per) if per else 0
@@ -147,12 +156,21 @@ def rough_templates(sm, band, min_area=3000):
     0.62 下会被螺钉头高光切成碎块、圆度不够 → 模板为 None → 螺栓孔一个都测不到
     （2026-10-21 实拍：0.62/0.66 达标暗斑 0 个，0.70 起才有）。所以按
     `ROUGH_DARK_THRS` 逐级放宽；**先试 0.62**，保证原有图（含两条回归用例）逐字符不变。
+
+    另外要挡住"整圈暗槽"：环面上的暗槽会连成一个外接框接近整圈的大暗斑，圆度也高，
+    评分必然压过沉孔（2026-10-22 实测外接框 2300px、圆度 0.89，模板因此选错、
+    6 个孔全变成"位置推定"）。孔不可能跟环带一个量级，所以外接框长边超过环带半径的
+    35% 直接不要。
     """
     bg = cv2.blur(sm, (201, 201))
     norm = sm / np.maximum(bg, 1)
+    ys, xs = np.nonzero(band)
+    if len(xs) == 0:
+        return None
+    max_side = 0.35 * 0.5 * max(np.ptp(xs), np.ptp(ys))
     best = None
     for thr in ROUGH_DARK_THRS:
-        best = _best_dark_blob(norm, band, thr, min_area)
+        best = _best_dark_blob(norm, band, thr, min_area, max_side)
         if best is not None:
             break
     if best is None:
