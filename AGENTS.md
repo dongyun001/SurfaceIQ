@@ -143,7 +143,11 @@ venv\Scripts\python.exe src\measure_ring.py --image data\captures\capture_single
   - **中心孔定位也是自适应的**：`_inner_candidates` 给"多个比例带 × 两种极性"的候选，
     `_inner_ok` 用点数+轴比+在外圈内+**与外圈同心**判可信。**旧档位排第一，且它的 r0 必须
     严格用 0.70**（不是波段中点 0.69——圆等价滤点边界跟着 r0 走，差这一点读数就变；
-    这个坑是基线回归门抓出来的）。⚠️ 中心孔现在**锁错了圆**，见 `docs/已知缺陷.md`。
+    这个坑是基线回归门抓出来的）。**档案有 `id_mm`/`od_mm` 时**，先用真值孔径比
+    （`id_mm/od_mm`）给一组窄带候选，带内取**最陡梯度**，再在"实测比落在 `INNER_RATIO_TOL` 内"
+    的候选里挑最接近的；没有真值才只走旧档位。**别改成"取缓坡最内侧像素"**——孔壁是约 0.02r
+    宽的缓坡，取坡脚会随窗口位置漂（实测 0.620~0.629 vs 最陡 0.630）。型号1 内圈有三圈
+    （55.9 / ~60 / ~78mm），只量最内侧；残差与依据见 `docs/已知缺陷.md` 缺陷 1。
   - **螺栓孔是"两个正交维度"的派发**（`LOCATE_FNS` / `BOUNDARY_FNS`），**所有型号平级**：
     `locate`（怎么定位孔）= `profile_angles` | `template_ngon`；
     `boundary`（量哪条边界）= `countersink_rim` | `dark_core`。
