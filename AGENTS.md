@@ -157,6 +157,10 @@ venv\Scripts\python.exe src\measure_ring.py --profile 型号2-4孔圆盘 --image
     的候选里挑最接近的；没有真值才只走旧档位。**别改成"取缓坡最内侧像素"**——孔壁是约 0.02r
     宽的缓坡，取坡脚会随窗口位置漂（实测 0.620~0.629 vs 最陡 0.630）。型号1 内圈有三圈
     （55.9 / ~60 / ~78mm），只量最内侧；残差与依据见 `docs/已知缺陷.md` 缺陷 1。
+  - **内圈**：`_measure_inner_rings` 按档案 `inner_rings` 的 `mm/od_mm` 圈定窄带，正/负极性
+    各拟一条边、取**中点**；只做加性测量（找不到两条边标失败，不拿一条边硬充）。
+    型号1 的 ~60/~78 各是一道环形槽；近正对实测 +0.41% / +0.24%
+    （见 `docs/自适应定位改造计划.md` 的「内圈」一节）。
   - **螺栓孔是"两个正交维度"的派发**（`LOCATE_FNS` / `BOUNDARY_FNS`），**所有型号平级**：
     `locate`（怎么定位孔）= `profile_angles` | `template_ngon`；
     `boundary`（量哪条边界）= `countersink_rim` | `dark_core`。
@@ -174,7 +178,8 @@ venv\Scripts\python.exe src\measure_ring.py --profile 型号2-4孔圆盘 --image
   **不要在 `gui_ring.py` 里自己再算一遍尺寸**。
 - **型号档案是唯一入口**：`models/part_profiles.json`。字段：`od_mm` / `id_mm` /
   `has_center_hole` / `bolt_mm` / `bolt_count` / `bolt_angles_rel`（相对角度，支持非等分）/
-  `bolt_circle_ratio` / `locate` / `boundary` / `mm_per_px` / `fingerprint_src`。
+  `bolt_circle_ratio` / `inner_rings`（`[{name, mm}]`，按两道边中点测）/
+  `locate` / `boundary` / `mm_per_px` / `fingerprint_src`。
 - **型号识别 = 外圈环带的极坐标指纹**（`polar_fingerprint` / `match_fingerprint`）。不传
   `--profile` 时：`find_outer` → 环带按归一化半径展开 → 与各型号指纹做**沿角度的循环互相关** →
   最高分过 `FP_ACCEPT` 且与次高分拉开 `FP_GAP` 才认；否则**不许猜**，只给像素 + 提示人工选型号

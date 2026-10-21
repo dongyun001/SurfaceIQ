@@ -24,6 +24,8 @@ OUTER_OUT_OF_FRAME_RATIO = 0.92  # 检出圆 < 更大同心圆的此比例 => �
 OUTER_CONCENTRIC_TOL = 0.15      # 判"同心"的圆心偏移上限（×检出半径）
 INNER_CENTER_MAX_SHIFT = 0.15  # 中心孔中心相对外圈中心的容许偏移（×外圈半径）
 INNER_RATIO_TOL = 0.035       # 实测孔径比与档案真值(id_mm/od_mm)的容许偏差
+INNER_RING_HALF = 0.035       # 内圈两道边的搜索半宽（归一化半径）
+INNER_RING_MIN_GAP = 0.005    # 两道边至少差这么多（×外圈半径），否则视为同一条边
 
 
 # ---------------- 射线亚像素边缘 ----------------
@@ -624,6 +626,54 @@ def _inner_ok(ell, n, outer_ell):
     return True
 
 
+def _measure_inner_rings(prof, sm, outer):
+    """按档案的 `inner_rings` 量内圈：每圈的两条边各拟一次，取中点。
+
+    为什么取中点：型号1 的 ~60/~78 两圈实测都是**环形槽**，各有一条内壁（亮→暗）和
+    一条外壁（暗→亮），两条边差 1~2mm。卡尺真值落在两条边中间；2026-10-22 实测中点
+    对 60/78 的偏差 +0.25%/+0.24%（见 docs/自适应定位改造计划.md 的「内圈」一节）。
+
+    只做加性测量：找不到两条边就标「失败」，绝不拿一条边硬充中点。
+    """
+    (ocx, ocy), (oa1, oa2), _ = outer
+    r_outer = (oa1 + oa2) / 4
+    out = []
+    for item in (prof.get("inner_rings") or []):
+        name = item.get("name") or "内圈"
+        mm = item.get("mm")
+        if not mm or not prof.get("od_mm"):
+            continue
+        exp = float(mm) / float(prof["od_mm"])
+        edges = []
+        for pol in (-1, +1):
+            pts = find_edge_points(sm, ocx, ocy,
+                                   (exp - INNER_RING_HALF) * r_outer,
+                                   (exp + INNER_RING_HALF) * r_outer,
+                                   pol, 2.0, n_ray=N_RAY)
+            ell, n = filter_and_fit(pts, ocx, ocy, exp * r_outer)
+            if ell is not None and _inner_ok(ell, n, outer):
+                edges.append((pol, ell, n))
+        fail = {"name": name, "mm_exp": float(mm), "status": "失败",
+                "dia": 0.0, "cx": 0.0, "cy": 0.0, "n": 0, "ell": None}
+        if len(edges) != 2 or edges[0][0] == edges[1][0]:
+            out.append(fail)
+            continue
+        (_, e1, n1), (_, e2, n2) = edges
+        r1 = (e1[1][0] + e1[1][1]) / 4
+        r2 = (e2[1][0] + e2[1][1]) / 4
+        if abs(r1 - r2) < INNER_RING_MIN_GAP * r_outer:
+            out.append(fail)        # 两种极性落在同一条边上，不是槽
+            continue
+        c1, c2 = e1[0], e2[0]
+        cx, cy = (c1[0] + c2[0]) / 2, (c1[1] + c2[1]) / 2
+        a1 = (e1[1][0] + e2[1][0]) / 2
+        a2 = (e1[1][1] + e2[1][1]) / 2
+        out.append({"name": name, "mm_exp": float(mm), "status": "OK",
+                    "dia": r1 + r2, "cx": cx, "cy": cy, "n": n1 + n2,
+                    "ell": ((cx, cy), (a1, a2), e1[2])})
+    return out
+
+
 # ---------------- 型号档案驱动的螺栓孔（装好紧固件的暗芯圆孔） ----------------
 
 def core_cross_points(gray, x, y, r_lo, r_hi, n_ray=48, frac=0.5):
@@ -1074,6 +1124,7 @@ def detect(img, init_c=None, init_r=None, profile=None):
     返回:
         outer: (center,(axis1,axis2),angle[,n]) 或 None
         center_hole: 同上
+        inner_rings: [{name, mm_exp, status, dia, cx, cy, n, ell}]（档案 inner_rings 声明几条就几条）
         bolts: [{cx,cy,dia,a1,a2,status,n,src}]，src=detected/profile/synthesized
         bolts_locate / bolts_boundary: 实际用到的策略名
         bolts_unverified: 是否走了兜底（缺档案或不完整）
@@ -1085,7 +1136,7 @@ def detect(img, init_c=None, init_r=None, profile=None):
     # ---- 外圈: 旧先验优先(保基线)，不行再自适应定位 ----
     found, sm, outer_fail = find_outer(gray, init_c, init_r)
     if found is None:
-        return {"outer": None, "center_hole": None, "bolts": [],
+        return {"outer": None, "center_hole": None, "bolts": [], "inner_rings": [],
                 "bolts_locate": None, "bolts_boundary": None, "bolts_unverified": True,
                 "outer_fail": outer_fail}
     outer, n_o = found
@@ -1121,6 +1172,9 @@ def detect(img, init_c=None, init_r=None, profile=None):
     else:
         (hcx, hcy), (ha1, ha2), hang = hole
 
+    # ---- 内圈（档案声明了几个就测几个；两条边取中点）----
+    inner_rings = _measure_inner_rings(prof, sm, outer)
+
     # ---- 螺栓孔: locate(怎么定位孔) + boundary(量哪条边界) 两个维度派发 ----
     norm = sm / np.maximum(cv2.blur(sm, (201, 201)), 1)
     ctx = {"sm": sm, "sm2": None, "gray": gray, "norm": norm,
@@ -1148,6 +1202,7 @@ def detect(img, init_c=None, init_r=None, profile=None):
                       "a1": ea1, "a2": ea2, "ang": eang, "n": n,
                       "src": s["src"], "status": "OK"})
     return {"outer": (outer, n_o), "center_hole": (hole, n_h), "bolts": bolts,
+            "inner_rings": inner_rings,
             "bolts_locate": locate_name, "bolts_boundary": boundary_name,
             "bolts_unverified": unverified, "outer_fail": None}
 

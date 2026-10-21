@@ -213,6 +213,7 @@ class RingResult:
     center_hole_mm: Optional[float] = None
     center_hole_px: Optional[float] = None
     center_hole_ellipse: Optional[tuple] = None
+    inner_rings: list = field(default_factory=list)  # [{name,mm,px,status,mm_exp}]
     bolts: list = field(default_factory=list)      # [{mm,px,a1,a2,cx,cy,status,ok}]
     tilt: float = 1.0
     touches_border: bool = False
@@ -469,6 +470,24 @@ def measure(img: np.ndarray, args) -> RingResult:
                 overall = "NG"
             _p(f"        标称 {args.spec_id} ±{args.tol}  偏差 {dev:+.3f}  -> {'OK' if ok else 'NG'}")
 
+    # ---- 内圈（档案声明的；每圈取两道边的中点）----
+    inner_out = []
+    for it in res.get("inner_rings", []):
+        if it.get("status") != "OK" or not it.get("dia"):
+            _p(f"{it['name']}: 未测到（期望 {it['mm_exp']:.2f} mm）")
+            warnings.append(f"{it['name']} 没测到")
+            inner_out.append({"name": it["name"], "mm": None, "px": None,
+                              "status": "失败", "mm_exp": it["mm_exp"]})
+            continue
+        it_mm = None if ratio is None else it["dia"] * ratio
+        if it_mm is None:
+            _p(f"{it['name']}: {it['dia']:.1f} px（无换算系数）")
+        else:
+            _p(f"{it['name']}: {it_mm:.3f} mm  ({it['dia']:.1f} px，"
+               f"期望 {it['mm_exp']:.2f} 偏差 {it_mm - it['mm_exp']:+.3f})")
+        inner_out.append({"name": it["name"], "mm": it_mm, "px": it["dia"],
+                          "status": "OK", "mm_exp": it["mm_exp"]})
+
     # ---- 螺栓孔 ----
     bolts_out = []
     if res["bolts"]:
@@ -518,6 +537,9 @@ def measure(img: np.ndarray, args) -> RingResult:
     cv2.ellipse(dbg, outer, (0, 255, 0), 8)
     if hole is not None:
         cv2.ellipse(dbg, hole, (0, 0, 255), 8)
+    for it in res.get("inner_rings", []):
+        if it.get("status") == "OK" and it.get("ell") is not None:
+            cv2.ellipse(dbg, it["ell"], (255, 0, 255), 6)
     for b in res["bolts"]:
         if b["status"] == "OK":
             cv2.ellipse(dbg, ((b["cx"], b["cy"]), (b["a1"], b["a2"]), b["ang"]), (255, 0, 0), 6)
@@ -534,7 +556,7 @@ def measure(img: np.ndarray, args) -> RingResult:
         src_desc=src_desc, timestamp=timestamp, ratio=ratio, ratio_src=ratio_src,
         outer_mm=od_mm, outer_px=outer_dia_px, outer_ellipse=outer,
         center_hole_mm=hole_mm, center_hole_px=hole_px, center_hole_ellipse=hole,
-        bolts=bolts_out, tilt=tilt, touches_border=touches_border,
+        inner_rings=inner_out, bolts=bolts_out, tilt=tilt, touches_border=touches_border,
         overall=overall, overall_judged=overall_judged, warnings=warnings,
         lines=lines, debug_jpg=dbg_path, report_txt=rep_path, debug_img=dbg,
         profile_name=(profile["_name"] if profile else None),

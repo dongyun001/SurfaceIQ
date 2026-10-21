@@ -359,7 +359,11 @@ class MeasureWindow:
         left = tk.Frame(body, bg=COLOR_BG)
         left.pack(side="left", anchor="n")
         self.lbl_od = self._number_row(left, "外径", 40)
-        self.lbl_id = self._number_row(left, "中心孔", 30, pady=(6, 10))
+        self.lbl_id = self._number_row(left, "中心孔", 30, pady=(6, 4))
+        self.inner_labels = []
+        for i in range(2):
+            self.inner_labels.append(
+                self._number_row(left, f"内圈{i+1}", 22, pady=(0, 3)))
 
         tk.Label(left, text="螺栓孔口径（沉孔口，非螺纹孔径）", font=(self.ui, 11),
                  bg=COLOR_BG, fg=COLOR_MUTED).pack(anchor="w")
@@ -382,7 +386,7 @@ class MeasureWindow:
         self.canvas_text = self.canvas.create_text(
             self.view_w // 2, self.view_h // 2, text="正在打开相机…",
             font=(self.ui, 13), fill="#9ca3af")
-        tk.Label(right, text="绿=外圈   红=中心孔   蓝=螺栓孔", font=(self.ui, 9),
+        tk.Label(right, text="绿=外圈   红=中心孔   品红=内圈   蓝=螺栓孔", font=(self.ui, 9),
                  bg=COLOR_BG, fg=COLOR_MUTED).pack(pady=(4, 0))
 
         # 提醒 / 报错区（默认不显示，有内容才 pack）
@@ -627,6 +631,17 @@ class MeasureWindow:
         else:
             self.lbl_id.config(text=f"{r.center_hole_mm:.3f}", fg=COLOR_TEXT)
 
+        for i, lbl in enumerate(self.inner_labels):
+            it = r.inner_rings[i] if i < len(r.inner_rings) else None
+            if it is None:
+                lbl.config(text="—", fg=COLOR_MUTED)
+            elif it.get("status") != "OK" or it.get("px") is None:
+                lbl.config(text="未测到", fg=COLOR_NG)
+            elif it.get("mm") is None:
+                lbl.config(text=f"{it['px']:.0f}(px)", fg=COLOR_MUTED)
+            else:
+                lbl.config(text=f"{it['mm']:.3f}", fg=COLOR_TEXT)
+
         for i, lbl in enumerate(self.bolt_labels):
             b = r.bolts[i] if i < len(r.bolts) else None
             if b is None or (b.get("mm") is None and b.get("px") is None):
@@ -645,6 +660,9 @@ class MeasureWindow:
             # 孔位只有 6 个（CIRCLED），多出来的**必须说出来**，不能静默丢掉——
             # 当年"写死 6 孔、12 孔零件静默只报 6 个"就是这一类坑。
             msgs.append(f"⚠ 本件检测到 {len(r.bolts)} 个孔，界面只显示前 {len(self.bolt_labels)} 个")
+        if len(r.inner_rings) > len(self.inner_labels):
+            msgs.append(f"⚠ 本件检测到 {len(r.inner_rings)} 个内圈，"
+                        f"界面只显示前 {len(self.inner_labels)} 个")
         if r.ident_source == IDENT_UNIDENTIFIED:
             # 认不出型号就不猜（没有读数总比拿错型号的读数安全）：提示操作员手动指定
             hint = ("⚠ 没能自动识别零件型号：请在上面「型号」里选一个（或选「无档案试测」）"
