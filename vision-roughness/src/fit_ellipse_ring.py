@@ -698,26 +698,8 @@ def _fit_circle(pts):
     return float(cx), float(cy), float(np.sqrt(max(c + cx * cx + cy * cy, 0.0)))
 
 
-def _outer_from_bolts(gray, sm, prof):
-    """外缘对比度太低时的回退：用紧固件先定圆心/朝向，再受约束地量外圈。
-
-    只给档案显式写了 `outer_fallback: "bolt_anchor"` 的型号用。思路：
-      1. 小窗口局部归一化找紧固件候选（它们比外缘对比度高得多）；
-      2. 用档案的 `bolt_angles_rel`（缺省按 bolt_count 等分）做三点定圆 + 角度模板匹配，
-         要求**声明几个孔就命中几个**，缺一个就放弃；
-      3. 由 `bolt_circle_ratio` 推出外圈期望半径，只在 ±7% 窄带里取最陡边、取中位半径。
-    外径仍然是**实测**的（不是用孔圈比例反推），所以"外径不对"仍检得出来。
-    """
-    ratio = prof.get("bolt_circle_ratio")
-    n_bolt = int(prof.get("bolt_count") or 0)
-    if not ratio or n_bolt < 3:
-        return None
-    rel = prof.get("bolt_angles_rel")
-    rel = [float(a) for a in rel] if rel else [360.0 * k / n_bolt for k in range(n_bolt)]
-    if len(rel) != n_bolt:
-        return None
-
-    # 1) 紧固件候选：小窗口归一化 + 逐档阈值
+def _bolt_candidates(sm, prof):
+    """小窗口局部归一化找紧固件候选（不依赖外圈）。返回 [(x, y)]。"""
     norm = sm / np.maximum(cv2.blur(sm, (BOLT_ANCHOR_NORM_WIN,) * 2), 1)
     a_min, a_max = BOLT_ANCHOR_AREA_MIN, BOLT_ANCHOR_AREA_MAX
     if prof.get("bolt_mm") and prof.get("mm_per_px"):
@@ -739,14 +721,28 @@ def _outer_from_bolts(gray, sm, prof):
             if any(np.hypot(x - px, y - py) < BOLT_ANCHOR_DEDUP for px, py in cands):
                 continue
             cands.append((float(x), float(y)))
-    if not (n_bolt <= len(cands) <= 40):
-        return None
+    return cands
 
-    # 2) 三点定圆 + 已知角度模板匹配（逐个锚相位）
+
+def _bolt_rel_angles(prof):
+    """型号的孔位相对角度；没给 `bolt_angles_rel` 时按 bolt_count 等分。"""
+    n_bolt = int(prof.get("bolt_count") or 0)
+    if n_bolt < 3:
+        return None, 0
+    rel = prof.get("bolt_angles_rel")
+    rel = [float(a) for a in rel] if rel else [360.0 * k / n_bolt for k in range(n_bolt)]
+    return (rel, n_bolt) if len(rel) == n_bolt else (None, 0)
+
+
+def _match_bolt_pattern(cands, rel, n_bolt, max_r):
+    """三点定圆 + 已知角度模板匹配（逐个锚相位）。
+
+    返回 (平均偏差px, picks, cx, cy, R) 或 None；要求**声明几孔就命中几孔**。
+    """
     best = None
     for tri in itertools.combinations(range(len(cands)), 3):
         cx, cy, R = _fit_circle([cands[i] for i in tri])
-        if not (0 < R < 0.55 * min(gray.shape)):
+        if not (0 < R < max_r):
             continue
         for anchor in range(n_bolt):
             ph = (np.arctan2(cands[tri[0]][1] - cy, cands[tri[0]][0] - cx)
@@ -765,12 +761,61 @@ def _outer_from_bolts(gray, sm, prof):
             if ok and len(set(picks)) == n_bolt:
                 score = float(np.mean(dists))
                 if best is None or score < best[0]:
-                    best = (score, picks)
-    if best is None:
-        return None
+                    best = (score, picks, cx, cy, R)
+    return best
 
-    # 3) 用命中的 n 个孔重新拟合孔圈，再受约束地量外圈
-    cx, cy, R = _fit_circle([cands[j] for j in best[1]])
+
+def identify_by_bolts(sm, profiles):
+    """常规外圈定位失败时，用"孔数 + 孔环角度"（几何量）识别型号。
+
+    只做**唯一匹配**：多个型号都像、或一个都不像，就如实返回 None（不猜）。
+    返回 (型号名 | None, 说明)。
+    """
+    hits = []
+    for name, prof in profiles.items():
+        if name.startswith("_"):
+            continue
+        rel, n_bolt = _bolt_rel_angles(prof)
+        if rel is None or not prof.get("bolt_circle_ratio"):
+            continue
+        cands = _bolt_candidates(sm, prof)
+        if not (n_bolt <= len(cands) <= 40):
+            continue
+        m = _match_bolt_pattern(cands, rel, n_bolt, 0.55 * min(sm.shape))
+        if m is None or m[0] > max(12.0, 0.03 * m[4]):
+            continue
+        hits.append((m[0], name, n_bolt))
+    if not hits:
+        return None, "孔型不匹配任何型号"
+    hits.sort()
+    if len(hits) > 1 and hits[1][0] <= hits[0][0] * 1.5 + 5.0:
+        cand = "、".join(f"{h[1]}({h[0]:.1f}px)" for h in hits[:3])
+        return None, f"孔型同时像多个型号：{cand}"
+    score, name, n_bolt = hits[0]
+    return name, f"孔型识别（{n_bolt} 孔，平均偏差 {score:.1f}px）"
+
+
+def _outer_from_bolts(gray, sm, prof):
+    """外缘对比度太低时的回退：用紧固件先定圆心/朝向，再受约束地量外圈。
+
+    只给档案显式写了 `outer_fallback: "bolt_anchor"` 的型号用。思路：
+      1. 小窗口局部归一化找紧固件候选（它们比外缘对比度高得多）；
+      2. 用档案的 `bolt_angles_rel`（缺省按 bolt_count 等分）做三点定圆 + 角度模板匹配，
+         要求**声明几个孔就命中几个**，缺一个就放弃；
+      3. 由 `bolt_circle_ratio` 推出外圈期望半径，只在 ±7% 窄带里取最陡边、取中位半径。
+    外径仍然是**实测**的（不是用孔圈比例反推），所以"外径不对"仍检得出来。
+    """
+    ratio = prof.get("bolt_circle_ratio")
+    rel, n_bolt = _bolt_rel_angles(prof)
+    if not ratio or rel is None:
+        return None
+    cands = _bolt_candidates(sm, prof)
+    if not (n_bolt <= len(cands) <= 40):
+        return None
+    m = _match_bolt_pattern(cands, rel, n_bolt, 0.55 * min(gray.shape))
+    if m is None:
+        return None
+    cx, cy, R = _fit_circle([cands[j] for j in m[1]])
     r_exp = R / float(ratio)
     pts = []
     for k in range(N_RAY):

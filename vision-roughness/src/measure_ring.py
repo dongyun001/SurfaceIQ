@@ -51,8 +51,8 @@ import config
 from camera_adapter import create_camera
 from fit_ellipse_ring import (DEFAULT_BOUNDARY, DEFAULT_LOCATE, FP_ANCHOR_HI, FP_ANCHOR_LO,
                               FP_ANCHOR_STEP, FP_DEPTH, FP_HARMONICS, FP_N_ANG, FP_N_RAD,
-                              FP_SIGMA_RAD, detect, find_outer, match_fingerprint,
-                              polar_fingerprint)
+                              FP_SIGMA_RAD, detect, find_outer, identify_by_bolts,
+                              match_fingerprint, polar_fingerprint)
 
 PROFILE_PATH = Path("models/part_profiles.json")
 FINGERPRINT_DIR = Path("models/fingerprints")   # 每型号一份 <型号名>.npz + <型号名>.png
@@ -65,6 +65,7 @@ IDENT_AUTO = "auto"                  # 自动识别成功
 IDENT_EXPLICIT = "explicit"          # 命令行/界面显式指定了型号
 IDENT_NOPROFILE = "noprofile"        # 显式要求按“无档案”试测
 IDENT_UNIDENTIFIED = "unidentified"  # 自动识别失败 -> 只给像素、请人工选型号
+IDENT_BOLTS = "bolts"                # 外圈低对比时按孔型（几何量）识别成功
 
 # 螺栓孔位置的来源标记：推定的位置必须让操作员看得出来，不能和实测的长得一样
 SRC_LABEL = {"detected": "实测峰", "profile": "档案角度", "synthesized": "位置推定"}
@@ -355,23 +356,41 @@ def measure(img: np.ndarray, args) -> RingResult:
         ident = f"命令行/界面指定型号「{profile['_name']}」"
         ident_source = IDENT_EXPLICIT
     else:
-        # **自动识别**：只用外圈椭圆算极坐标指纹（归一化展开 + 标准化，全无量纲，
+        # **自动识别**：常规路径用外圈椭圆算极坐标指纹（归一化展开 + 标准化，全无量纲，
         # 所以不需要 mm/px，不会和"按型号存系数"循环依赖）。
         gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-        found, _, outer_fail = find_outer(gray)
-        if found is None:
-            raise MeasureError(_outer_fail_message(img, outer_fail))
+        found, sm, outer_fail = find_outer(gray)
         fingerprints, fp_missing = load_fingerprints(profiles)
-        name, why = match_fingerprint(polar_fingerprint(gray, found[0]), fingerprints)
-        if name is None:
-            # 认不出来就**不猜**：与 --profile none 同一语义（未验证 + 只给像素），
-            # 让操作员在界面里选型号或命令行 --profile。绝不"按某个型号测"——那会拿
-            # 错型号的标称值和 mm/px 给出一个理直气壮的错读数。
-            ident = f"自动识别失败（{why}）→ **未识别到型号，请人工选择**"
+        if found is not None:
+            name, why = match_fingerprint(polar_fingerprint(gray, found[0]), fingerprints)
+            if name is None:
+                # 指纹没认出来（跨光照/跨机位很常见）：再用**孔型**（几何量）试一次。
+                # 仍然只认唯一匹配。
+                name2, why2 = identify_by_bolts(sm, profiles)
+                if name2 is not None:
+                    profile = named_profile(profiles, name2)
+                    ident = f"自动识别型号「{name2}」（指纹未命中，{why2}）"
+                    ident_source = IDENT_BOLTS
+                else:
+                    # 认不出来就**不猜**：与 --profile none 同一语义（未验证 + 只给像素），
+                    # 让操作员在界面里选型号或命令行 --profile。绝不"按某个型号测"——那会拿
+                    # 错型号的标称值和 mm/px 给出一个理直气壮的错读数。
+                    ident = (f"自动识别失败（{why}；{why2}）"
+                             "→ **未识别到型号，请人工选择**")
+            else:
+                profile = named_profile(profiles, name)
+                ident = f"自动识别型号「{name}」（{why}）"
+                ident_source = IDENT_AUTO
         else:
+            # 外圈常规定位失败 -> 指纹失去径向基准，改用**孔型（几何量）**识别。
+            # 只认唯一匹配：多个型号都像 / 一个都不像，都不猜。
+            name, why = identify_by_bolts(sm, profiles)
+            if name is None:
+                raise MeasureError(_outer_fail_message(img, outer_fail)
+                                   + f"\n孔型识别也没能定型号：{why}")
             profile = named_profile(profiles, name)
-            ident = f"自动识别型号「{name}」（{why}）"
-            ident_source = IDENT_AUTO
+            ident = f"外圈对比度低，按孔型识别型号「{name}」（{why}）"
+            ident_source = IDENT_BOLTS
     # --mm-per-px 是"本次测量用这个系数"，检测里用到系数的路径（如 dark_core 的搜索带）
     # 也必须跟着走，否则报告和检测会用两套比例。回归门靠它把系数钉死。
     if args.mm_per_px and profile:

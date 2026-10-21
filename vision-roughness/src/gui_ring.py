@@ -48,16 +48,17 @@ from tkinter import messagebox, ttk  # noqa: E402
 
 import config  # noqa: E402
 from camera_adapter import create_camera  # noqa: E402
-from measure_ring import (IDENT_AUTO, IDENT_EXPLICIT, IDENT_NOPROFILE, IDENT_UNIDENTIFIED,
-                          MeasureError, build_parser, load_profiles, measure)  # noqa: E402
+from measure_ring import (IDENT_AUTO, IDENT_BOLTS, IDENT_EXPLICIT, IDENT_NOPROFILE,
+                          IDENT_UNIDENTIFIED, MeasureError, build_parser, load_profiles,
+                          measure)  # noqa: E402
 
 LOG_PATH = PROJECT_ROOT / "debug" / "gui_error.log"
 RUN_LOG = PROJECT_ROOT / "debug" / "gui_run.log"
 
 CIRCLED = "①②③④⑤⑥"
-PICK_AUTO = "自动识别（按指纹）"        # 型号下拉框的两个固定项
+PICK_AUTO = "自动识别（指纹/孔型）"     # 型号下拉框的两个固定项
 PICK_NOPROFILE = "无档案试测（只给像素）"
-IDENT_LABEL = {IDENT_AUTO: "自动识别", IDENT_EXPLICIT: "人工指定",
+IDENT_LABEL = {IDENT_AUTO: "自动识别", IDENT_BOLTS: "孔型识别", IDENT_EXPLICIT: "人工指定",
                IDENT_NOPROFILE: "无档案试测", IDENT_UNIDENTIFIED: "未识别"}
 COLOR_BG = "#ffffff"
 COLOR_TEXT = "#111827"
