@@ -12,8 +12,9 @@ __pycache__/
 # 运行时产物（每次测量/调试自动生成，不进入仓库）
 debug/
 vision-roughness/data/captures/*
-# 目前没有例外：旧回归夹具 2026-10-23 已删（等重拍）。以后加夹具图按 AGENTS.md §4 办理：
-# 在这里用 ! 单列，不要 git add -f
+# 例外：AGENTS.md §3 的两张回归夹具（2026-10-23 在固定机位重拍）必须入库
+!vision-roughness/data/captures/capture_20261023_032001.jpg
+!vision-roughness/data/captures/capture_20261023_032617.jpg
 # temp/ 下只保留排查脚本 hik_debug.py，其余忽略
 **/temp/*
 !**/temp/hik_debug.py

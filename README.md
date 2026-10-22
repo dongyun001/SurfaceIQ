@@ -81,7 +81,7 @@ venv\Scripts\python.exe -c "import cv2, numpy; print(cv2.__version__, numpy.__ve
 ```bash
 venv\Scripts\python.exe src\measure_ring.py                          # 相机现拍并测量
 venv\Scripts\python.exe src\measure_ring.py --image <图片路径>        # 测已有照片（图放 data/captures/）
-venv\Scripts\python.exe src\measure_ring.py --profile 型号1-6孔圆环 --ref-mm 88.60   # 标定该型号
+venv\Scripts\python.exe src\measure_ring.py --image data\captures\capture_20261023_032001.jpg --ref-mm 88.28   # 标定机位
 venv\Scripts\python.exe src\measure_ring.py --image data\captures\<图>.jpg --ref-mm 88.28  # 标定机位
 ```
 
@@ -290,13 +290,13 @@ SurfaceIQ/
 
 1. 改 `src/config.py` 的 `CAMERA_TYPE` / `CAMERA_KWARGS`（业务代码零改动）；
 2. 卡尺量出零件外径真值，重新标定**机位**的换算系数（`--ref-mm`，写进 `models/rig.json`，
-   每个型号各一份）：
+   **整台设备只一份**）：
 
    ```bash
-   venv\Scripts\python.exe src\measure_ring.py --profile <型号名> --ref-mm <外径真值mm>
+   venv\Scripts\python.exe src\measure_ring.py --image data\captures\<图>.jpg --ref-mm <外径真值mm>
    ```
 
-3. 换算系数跟着「相机 + 镜头 + 拍摄距离 + **倾角**」走，**任一变化都必须对该型号重新标定**。
+3. 换算系数跟着「相机 + 镜头 + 拍摄距离 + **倾角** + 曝光」走，**任一变化都必须重新标定机位**。
    换支架后先验"是不是真的正对"：拿新拍的图看报告里的外圈椭圆，**长短轴比 ≈1.000~1.005**
    才算正；≥1.02 会打「透视提醒」，说明还斜着（此时均值直径会系统性偏小）。
 

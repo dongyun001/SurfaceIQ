@@ -262,7 +262,7 @@ def measure(img: np.ndarray, args) -> RingResult:
         _p("    强度只说明边在图像里显不显眼，**不代表它是不是你要量的尺寸**，别靠它判真假；")
         _p("    但整张图都弱时位置精度明显变差，这类读数不确定度大于 ±1.4%。")
         warnings.append("本图没有强边（整体对比度低）：先补光/对焦，读数不确定度更大")
-    if len(edges) <= 1:
+    if len(detected) <= 1:
         _p("（只找到外缘：这件零件没有检出同心内边——实心光滑盘就是这样）")
 
     if ratio is not None:
