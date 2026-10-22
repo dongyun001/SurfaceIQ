@@ -48,18 +48,17 @@ from tkinter import messagebox, ttk  # noqa: E402
 
 import config  # noqa: E402
 from camera_adapter import create_camera  # noqa: E402
-from measure_ring import (IDENT_AUTO, IDENT_BOLTS, IDENT_EXPLICIT, IDENT_NOPROFILE,
-                          IDENT_UNIDENTIFIED, MeasureError, build_parser, load_profiles,
+from measure_ring import (IDENT_EXPLICIT, IDENT_NOPROFILE, IDENT_UNIDENTIFIED,
+                          MeasureError, build_parser, load_profiles,
                           measure)  # noqa: E402
 
 LOG_PATH = PROJECT_ROOT / "debug" / "gui_error.log"
 RUN_LOG = PROJECT_ROOT / "debug" / "gui_run.log"
 
 CIRCLED = "①②③④⑤⑥"
-PICK_AUTO = "自动识别（指纹/孔型）"     # 型号下拉框的两个固定项
-PICK_NOPROFILE = "无档案试测（只给像素）"
-IDENT_LABEL = {IDENT_AUTO: "自动识别", IDENT_BOLTS: "孔型识别", IDENT_EXPLICIT: "人工指定",
-               IDENT_NOPROFILE: "无档案试测", IDENT_UNIDENTIFIED: "未识别"}
+PICK_NOPROFILE = "无档案试测（只给像素）"   # 下拉框的固定项（自动识别已于 2026-10-23 删除）
+IDENT_LABEL = {IDENT_EXPLICIT: "人工指定", IDENT_NOPROFILE: "无档案试测",
+               IDENT_UNIDENTIFIED: "未指定型号"}
 COLOR_BG = "#ffffff"
 COLOR_TEXT = "#111827"
 COLOR_MUTED = "#6b7280"
@@ -125,9 +124,10 @@ def _now() -> str:
 
 
 def model_choices() -> list:
-    """型号下拉框的选项：「自动识别」+ 档案里的型号 +「无档案试测」。
+    """型号下拉框的选项：档案里的型号 +「无档案试测」。
 
-    读不到档案（文件缺失/损坏）也不能让窗口起不来：退回只剩两个固定项并记日志——
+    **没有"自动识别"这一项了**（2026-10-23 删除）：不选型号就只给像素、不猜。
+    读不到档案（文件缺失/损坏）也不能让窗口起不来：退回只剩固定项并记日志——
     窗口是车间唯一的入口，宁可少几个选项也不能打不开。
     """
     names = []
@@ -135,7 +135,7 @@ def model_choices() -> list:
         names = [k for k in load_profiles() if not k.startswith("_")]
     except Exception as e:                  # noqa: BLE001
         write_log(f"[{_now()}] 读型号档案失败，型号下拉框只保留固定项: {e}")
-    return [PICK_AUTO] + names + [PICK_NOPROFILE]
+    return names + [PICK_NOPROFILE]
 
 
 def _open_file(path):
@@ -450,7 +450,7 @@ class MeasureWindow:
         root.minsize(w, h)
 
     def _build_profile_picker(self, root):
-        """型号下拉框（「自动识别」/ 各型号 /「无档案试测」）。"""
+        """型号下拉框（各型号 /「无档案试测」）。没有"自动识别"——不选就只给像素。"""
         pick = tk.Frame(root, bg=COLOR_BG)
         pick.pack(fill="x", padx=18, pady=(2, 0))
         tk.Label(pick, text="型号:", font=(self.ui, 11), bg=COLOR_BG,
@@ -458,10 +458,11 @@ class MeasureWindow:
         # takefocus=0：点过下拉框后焦点别留在它身上，否则空格会去开下拉菜单而不是测量
         self.cmb_profile = ttk.Combobox(pick, state="readonly", width=22, takefocus=0,
                                         values=model_choices(), font=(self.ui, 11))
-        self.cmb_profile.set(PICK_AUTO)
+        # 默认「无档案试测」：不替操作员假定型号（自动识别已删，猜型号会给出理直气壮的错读数）
+        self.cmb_profile.set(PICK_NOPROFILE)
         self.cmb_profile.pack(side="left", padx=(6, 8))
         self.cmb_profile.bind("<<ComboboxSelected>>", self._on_profile_pick)
-        tk.Label(pick, text="（自动识别失败时，在这里选零件型号）", font=(self.ui, 9),
+        tk.Label(pick, text="（在这里选零件型号；不选就只给像素）", font=(self.ui, 9),
                  bg=COLOR_BG, fg=COLOR_MUTED).pack(side="left")
 
     def _on_profile_pick(self, _event=None):
@@ -473,9 +474,7 @@ class MeasureWindow:
         if self.cmb_profile is None:
             return
         picked = self.cmb_profile.get()
-        if picked == PICK_AUTO:
-            self.args.profile = None                 # 不传 = 自动识别
-        elif picked == PICK_NOPROFILE:
+        if picked == PICK_NOPROFILE:
             self.args.profile = "none"               # 与 --profile none 同一语义
         else:
             self.args.profile = picked

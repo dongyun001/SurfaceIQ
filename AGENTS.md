@@ -77,8 +77,8 @@ venv\Scripts\python.exe src\measure_ring.py --profile 型号1-6孔圆环 --image
 venv\Scripts\python.exe src\measure_ring.py --profile 型号2-4孔圆盘 --mm-per-px 0.04836640294230451 --image data\captures\capture_single_20261007_203729.jpg
 ```
 
-**必须显式带 `--profile`**：指纹会随机位/光照重建，回归门不能依赖自动识别
-（2026-10-22 换机位重建指纹后，不带档案就认不出旧夹具了，中心孔会退回旧逻辑）。
+**必须显式带 `--profile`**：不传型号就只给像素、不给毫米（型号识别已于 2026-10-23 删除），
+回归门不能依赖自动识别——它本来就在两条用例上一次都没用上。
 
 **用例2 还要钉住 `--mm-per-px`**：`dark_core` 用 `bolt_mm/mm_per_px` 定搜索带，
 重标系数会连带改孔 px；钉住后 px 才是纯检测信号。
@@ -128,9 +128,8 @@ git checkout pre-concentric -- data/captures/capture_20260908_115557.jpg vision-
   而且属于"上次标定的某个型号"。现在系数只存在型号档案里；查不到就**只报像素、不给毫米**。
 - **不入库**（`.gitignore`）：`debug/`、`vision-roughness/data/captures/*`、`venv/`、`.zcode/`、
   `**/temp/*`（仅保留 `hik_debug.py`）、`**/models/*.pth`。运行时产物别 `git add`。
-- **入库的参考数据**：`models/part_profiles.json`、`models/fingerprints/*.npz`。
-  指纹**必须入库**——它的参考图不入库，指纹是自动识别的唯一凭据。
-  （`.png` 预览原先也入库，2026-10-23 随图片清空已删。）
+- **入库的参考数据**：现在只剩 `models/part_profiles.json`。
+  （`models/fingerprints/*` 已于 2026-10-23 随"删除型号识别"一并删除，**别再生成**。）
 - **`data/captures/` 现在没有任何例外**（旧回归夹具 2026-10-23 已删，等重拍）。
   以后再加夹具图照此办理：**在 `.gitignore` 里显式 `!` 出来，不要用 `git add -f`**（后者会留下
   "已跟踪但仍被忽略"的状态，后人 grep 时看不出是故意的）。
@@ -155,11 +154,7 @@ git checkout pre-concentric -- data/captures/capture_20260908_115557.jpg vision-
   不是标定。详见 `docs/已知缺陷.md`。
 - **外缘是一条"有厚度的带"**（倒角/圆角 + 斜视下有的角度亮、有的暗）：所以**同一个零件转个角度，
   检出的外径会变**（实测 47° 时 +2.5%），拟合椭圆会落到带的不同位置。任何"以检出外圈为基准"的
-  东西（含指纹）都要考虑这件事。
-- **改指纹的"展开"参数必须重建全部 `.npz`**：指纹存档里就是按这些参数算出来的数组。
-  只改判定阈值（`FP_ACCEPT`/`FP_GAP`）不用重建；改 `FP_N_ANG`/`FP_N_RAD`/`FP_DEPTH`/
-  `FP_ANCHOR_*`/`FP_SIGMA_RAD`/`FP_HARMONICS` 之后**每个型号都要 `--save-fingerprint` 重跑**。
-  重建是确定性的（同样输入 → 逐位相同的数组）。
+  东西都要考虑这件事。
 - **`--spec-*` 一个都不给时"综合判定: OK"不是合格判定**，只是"未判定"的默认串
   （`overall_judged=False`，GUI 显示「已测量」）。现在**判定只认命令行传的 `--spec-*`**，
   档案里的 `od_mm`/`id_mm` 还没接进判定——别误以为档案填了标称值就会自动判 OK/NG。
@@ -221,18 +216,12 @@ git checkout pre-concentric -- data/captures/capture_20260908_115557.jpg vision-
   `has_center_hole` / `bolt_mm` / `bolt_count` / `bolt_angles_rel`（相对角度，支持非等分）/
   `bolt_circle_ratio` / `inner_rings`（`[{name, mm}]`，按两道边中点测）/
   `outer_fallback`（可选 `bolt_anchor`，见下）/
-  `locate` / `boundary` / `mm_per_px` / `fingerprint_src`。
-- **型号识别 = 外圈环带的极坐标指纹**（`polar_fingerprint` / `match_fingerprint`）。不传
-  `--profile` 时：`find_outer` → 环带按归一化半径展开 → 与各型号指纹做**沿角度的循环互相关** →
-  最高分过 `FP_ACCEPT` 且与次高分拉开 `FP_GAP` 才认；否则**不许猜**，只给像素 + 提示人工选型号
-  （界面顶部「型号」下拉框 / `--profile`）。**现场实测数据与局限**见
-  `docs/已知缺陷.md` 缺陷 2/5。
-  生成/更新指纹：`--image <参考图> --profile <型号名> --save-fingerprint`（**必须显式带
-  `--profile`**，同 `--ref-mm` 的理由：否则会悄悄覆盖某个型号的指纹）。
-- **识别还有第二判据：孔型（几何量）**（`identify_by_bolts`）。指纹没认出来、或外圈常规定位
-  失败时，用 `bolt_count` + `bolt_angles_rel` 检查紧固件的**孔数与相对角度**，**唯一匹配才认**，
-  多个/没有都不猜。型号1 是 6 等分、型号2 是 4 孔 72/108° 交替。同孔数同角度的新型号仍分不开，
-  那时只能靠指纹或人工指定。
+  `locate` / `boundary` / `mm_per_px`。
+- **型号识别已于 2026-10-23 整体删除**（`polar_fingerprint` / `match_fingerprint` /
+  `identify_by_bolts` / 全部 `FP_*` / `--save-fingerprint` / `models/fingerprints/*`）。
+  **不传 `--profile` 就不再猜**：只给像素、不给毫米，让人在界面下拉框或命令行选型号。
+  别再以"以前有过自动识别"为由重建它——两条用例本来就没用上，而且它是缺陷 2/5 的来源；
+  `docs/设计决策记录.md` §5 是它当年的设计，已标注废止。
 - **显示层**：`src/gui_ring.py` 只做显示/交互，不改数值。它负责**实时取景**，所以有一条硬约束：
   取帧与测量**只在同一个后台线程**（`LiveSource`）里做，**绝不能让两个线程同时 `capture()`**
   （相机是独占资源）；tkinter 只能在主线程碰，后台线程只往队列塞「编码好的 PNG 字节」和事件。

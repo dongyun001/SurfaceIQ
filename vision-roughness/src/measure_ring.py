@@ -1,11 +1,9 @@
 r"""圆环/法兰类零件尺寸测量：外径、中心孔、螺栓孔，一键出毫米数。
 
 **型号档案是唯一入口**（models/part_profiles.json）：每个零件型号一份档案，写清它的标称值
-和该走哪条检测策略。不传 --profile 时**自动识别型号**（极坐标指纹，见 fit_ellipse_ring 的
-`polar_fingerprint`）——车间日常入口走这条；识别不出来就**不猜**：本次只给像素、结果标为
-未经验证，并提示人工选型号（界面上有下拉框，命令行用 --profile）。
-传 --profile none 则明确按“无档案”处理，与识别失败同一语义。
-传 --profile <型号名> 是人工指定的兜底入口。
+和该走哪条检测策略。传 --profile <型号名> 人工指定；传 --profile none 明确按“无档案”试测。
+不传 --profile 时**不再猜测**：本次只给像素、结果标未验证，并提示人工选型号
+（型号识别已于 2026-10-23 删除，理由见文件末尾）。
 
 三种用法：
     1) 图形界面（日常用，推荐）：双击项目里的 `测量.bat`
@@ -14,8 +12,6 @@ r"""圆环/法兰类零件尺寸测量：外径、中心孔、螺栓孔，一键
     2) 命令行（标定 / 排错用）：项目根目录 vision-roughness/ 下
        python src\measure_ring.py --image data\captures\xxx.jpg
        python src\measure_ring.py --profile <型号名> --ref-mm 88.60   # 标定该型号的系数
-       python src\measure_ring.py --profile <型号名> --image <参考图> --save-fingerprint
-                                                                     # 给该型号建指纹
 
 每次测量会在 debug\ 下存两份记录：measure_ring_debug.jpg（画出轮廓的图）
 和 报告_年月日_时分秒.txt（文字报告）。
@@ -32,8 +28,8 @@ r"""圆环/法兰类零件尺寸测量：外径、中心孔、螺栓孔，一键
     螺栓孔 : locate(怎么定位孔) + boundary(量哪条边界) 两个策略维度，型号档案里各指定一个
              locate   = profile_angles(档案角度+相位搜索) | template_ngon(模板匹配+n等分校验)
              boundary = countersink_rim(沉孔口阈值交叉)    | dark_core(暗芯中分界)
-型号识别（不传 --profile 时）：外圈椭圆 -> 环带极坐标展开 -> 与各型号指纹循环互相关，
-    只在明确命中时才认（最高分够高、且与次高分拉开），否则如实报“未识别”。
+⚠️ 型号识别（极坐标指纹 + 孔型判据）已于 2026-10-23 整体删除：它是缺陷 2/5 的来源，
+    而回归门本来就要求显式 --profile，两条用例上一次都没用上它。
 """
 import argparse
 import json
@@ -49,23 +45,17 @@ import numpy as np
 sys.path.insert(0, "src")
 import config
 from camera_adapter import create_camera
-from fit_ellipse_ring import (DEFAULT_BOUNDARY, DEFAULT_LOCATE, FP_ANCHOR_HI, FP_ANCHOR_LO,
-                              FP_ANCHOR_STEP, FP_DEPTH, FP_HARMONICS, FP_N_ANG, FP_N_RAD,
-                              FP_SIGMA_RAD, detect, find_outer, identify_by_bolts,
-                              match_fingerprint, polar_fingerprint)
+from fit_ellipse_ring import DEFAULT_BOUNDARY, DEFAULT_LOCATE, detect
 
 PROFILE_PATH = Path("models/part_profiles.json")
-FINGERPRINT_DIR = Path("models/fingerprints")   # 每型号一份 <型号名>.npz + <型号名>.png
 NO_PROFILE = ("none", "off", "无")  # --profile 显式要求“没有档案”时的取值
 DEBUG_DIR = Path("debug")
 BORDER_MARGIN = 5  # 轮廓距图像边缘小于此值视为“零件超出视野”
 
 # 型号是怎么定下来的（界面据此提示，别用字符串去猜）。GUI 读 RingResult.ident_source。
-IDENT_AUTO = "auto"                  # 自动识别成功
 IDENT_EXPLICIT = "explicit"          # 命令行/界面显式指定了型号
 IDENT_NOPROFILE = "noprofile"        # 显式要求按“无档案”试测
-IDENT_UNIDENTIFIED = "unidentified"  # 自动识别失败 -> 只给像素、请人工选型号
-IDENT_BOLTS = "bolts"                # 外圈低对比时按孔型（几何量）识别成功
+IDENT_UNIDENTIFIED = "unidentified"  # 没指定型号 -> 只给像素、请人工选型号
 
 # 螺栓孔位置的来源标记：推定的位置必须让操作员看得出来，不能和实测的长得一样
 SRC_LABEL = {"detected": "实测峰", "profile": "档案角度", "synthesized": "位置推定"}
@@ -100,97 +90,9 @@ def save_profile_mm_per_px(prof, ratio):
     PROFILE_PATH.write_text(json.dumps(profiles, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
-# ---------------- 型号指纹的存取（自动识别用的参考数据） ----------------
-
-FP_META_NOTE = ("参考图默认不入库（data/captures/ 被 .gitignore 忽略，例外只有 AGENTS.md §3 "
-                "那几张回归夹具图），指纹是自动识别的凭据：换参考图/换机位/换光照/换镜头"
-                "都必须重新生成，否则识别会失准")
-
-
-def fingerprint_path(name: str) -> Path:
-    """某型号的指纹文件路径。指纹按型号名与档案一一对应。"""
-    return FINGERPRINT_DIR / f"{name}.npz"
-
-
-def load_fingerprints(profiles: dict):
-    """读所有型号的指纹，返回 (指纹 dict, 缺指纹的型号名列表)。
-
-    没有指纹文件（或文件读不出来）的型号**不参与自动识别**——照实报出来，让人知道该
-    去建档，而不是静默当成"这个型号不像"。--profile 显式指定照旧可用，不受影响。
-    """
-    fps, missing = {}, []
-    for name in profiles:
-        if name.startswith("_"):
-            continue
-        path = fingerprint_path(name)
-        if not path.exists():
-            missing.append(name)
-            continue
-        try:
-            with np.load(path, allow_pickle=False) as z:
-                fps[name] = np.asarray(z["fp"], dtype=np.float32)
-        except (OSError, KeyError, ValueError):
-            missing.append(name)
-    return fps, missing
-
-
-def save_fingerprint(prof, fp, src, shape):
-    """写 <型号名>.npz（指纹 + 元数据）与 <型号名>.png（人类可核对的预览）。
-
-    用 .npz 而不是 .npy：一个型号只落两个文件，参数/来源/生成时间都跟着指纹走，
-    以后复核参数不用去翻代码。指纹必须入库（参考图不在库里），否则新克隆的仓库
-    自动识别直接失效。
-    """
-    FINGERPRINT_DIR.mkdir(parents=True, exist_ok=True)
-    npz = fingerprint_path(prof["_name"])
-    meta = {"n_ang": FP_N_ANG, "n_rad": FP_N_RAD, "depth": FP_DEPTH,
-            "anchor_lo": FP_ANCHOR_LO, "anchor_hi": FP_ANCHOR_HI,
-            "anchor_step": FP_ANCHOR_STEP, "sigma_rad": FP_SIGMA_RAD,
-            "harmonics": FP_HARMONICS}
-    np.savez_compressed(npz, fp=fp.astype(np.float32), name=prof["_name"], src=str(src),
-                        img_shape=np.asarray(shape, dtype=np.int64),
-                        params=json.dumps(meta, ensure_ascii=False),
-                        built=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                        note=FP_META_NOTE)
-    png = FINGERPRINT_DIR / f"{prof['_name']}.png"
-    prev = fp.T                                     # 行=半径、列=角度，便于目视核对
-    lo, hi = float(prev.min()), float(prev.max())
-    img = ((prev - lo) / max(hi - lo, 1e-9) * 255).astype(np.uint8)
-    img = cv2.resize(img, (FP_N_ANG * 2, FP_N_RAD * 8), interpolation=cv2.INTER_NEAREST)
-    # 文件名是中文，**cv2.imwrite 会静默失败**（返回 False，不抛异常，跟 cv2.imread
-    # 遇中文路径返回 None 是同一个坑）——所以先编码再 tofile。
-    ok, buf = cv2.imencode(".png", img)
-    if ok:
-        buf.tofile(str(png))
-    return npz, (png if ok else None)
-
-
-def build_fingerprint(args, img):
-    """把这张图当作某型号的参考图，生成/覆盖它的极坐标指纹。
-
-    **必须显式带 --profile**（和 --ref-mm 同一个理由）：不写型号就会落到某个型号上，
-    把它的指纹悄悄覆盖掉。参考图必须是该型号自己的实拍图——指纹描述的是这张图的
-    成像（机位、光照、零件朝向都是它的一部分）。
-    """
-    name = getattr(args, "profile", None)
-    if not name or name.lower() in NO_PROFILE:
-        raise MeasureError(
-            "生成型号指纹必须**显式**指明型号：\n"
-            "    python src\\measure_ring.py --image <参考图> --profile <型号名> --save-fingerprint\n"
-            "    （不写 --profile 会把某个型号已有的指纹悄悄覆盖掉）"
-        )
-    prof = named_profile(load_profiles(), name)
-    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-    found, _, outer_fail = find_outer(gray)
-    if found is None:
-        raise MeasureError("无法生成指纹：" + _outer_fail_message(img, outer_fail))
-    fp = polar_fingerprint(gray, found[0])
-    npz, png = save_fingerprint(prof, fp, args.image or "相机现拍", img.shape[:2])
-    print(f"已生成型号「{prof['_name']}」的指纹: {npz}")
-    print(f"  预览图（横轴=角度 0~360°，纵轴=从外缘往内）: {png or '（写失败）'}")
-    print(f"  指纹 {fp.shape[0]}×{fp.shape[1]}  参考图: {args.image or '相机现拍'}")
-    print(f"  注意：{FP_META_NOTE}")
-    return npz, png
+# 型号识别与指纹存取已于 2026-10-23 整体删除（`polar_fingerprint` / `match_fingerprint` /
+# `identify_by_bolts` / `--save-fingerprint` / `models/fingerprints/`）。理由：它是缺陷 2/5 的
+# 来源，而回归门本来就要求显式 `--profile`，自动识别在两条用例上一次都没用上。
 
 
 class MeasureError(Exception):
@@ -239,13 +141,10 @@ def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description="圆环类零件尺寸测量")
     p.add_argument("--image", help="测已有照片；不指定则相机现拍")
     p.add_argument("--profile", default=None,
-                   help="零件型号名（见 models/part_profiles.json）；不传则**自动识别**，"
-                        "识别不出来就只给像素并提示人工选型号；传 none 明确按“无档案”试测")
+                   help="零件型号名（见 models/part_profiles.json）；不传就只给像素并提示人工选型号；"
+                        "传 none 明确按“无档案”试测")
     p.add_argument("--ref-mm", type=float,
                    help="零件外径真值(mm)，用于标定该型号的换算系数（必须配 --profile）")
-    p.add_argument("--save-fingerprint", action="store_true",
-                   help="把 --image 这张图当作该型号的参考图，生成/覆盖 "
-                        "models/fingerprints/<型号名>.npz（必须配 --profile）")
     p.add_argument("--mm-per-px", type=float, help="直接指定 mm/px")
     p.add_argument("--spec-od", type=float, help="外径标称值(mm)，用于 OK/NG")
     p.add_argument("--spec-id", type=float, help="中心孔标称值(mm)，用于 OK/NG")
@@ -346,7 +245,6 @@ def measure(img: np.ndarray, args) -> RingResult:
     explicit = getattr(args, "profile", None)
     profile, ident = None, ""
     ident_source = IDENT_UNIDENTIFIED
-    fp_missing: list = []
     if explicit and explicit.lower() in NO_PROFILE:
         ident = "命令行/界面要求按「无档案」处理：通用试测，结果未验证"
         ident_source = IDENT_NOPROFILE
@@ -356,41 +254,10 @@ def measure(img: np.ndarray, args) -> RingResult:
         ident = f"命令行/界面指定型号「{profile['_name']}」"
         ident_source = IDENT_EXPLICIT
     else:
-        # **自动识别**：常规路径用外圈椭圆算极坐标指纹（归一化展开 + 标准化，全无量纲，
-        # 所以不需要 mm/px，不会和"按型号存系数"循环依赖）。
-        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-        found, sm, outer_fail = find_outer(gray)
-        fingerprints, fp_missing = load_fingerprints(profiles)
-        if found is not None:
-            name, why = match_fingerprint(polar_fingerprint(gray, found[0]), fingerprints)
-            if name is None:
-                # 指纹没认出来（跨光照/跨机位很常见）：再用**孔型**（几何量）试一次。
-                # 仍然只认唯一匹配。
-                name2, why2 = identify_by_bolts(sm, profiles)
-                if name2 is not None:
-                    profile = named_profile(profiles, name2)
-                    ident = f"自动识别型号「{name2}」（指纹未命中，{why2}）"
-                    ident_source = IDENT_BOLTS
-                else:
-                    # 认不出来就**不猜**：与 --profile none 同一语义（未验证 + 只给像素），
-                    # 让操作员在界面里选型号或命令行 --profile。绝不"按某个型号测"——那会拿
-                    # 错型号的标称值和 mm/px 给出一个理直气壮的错读数。
-                    ident = (f"自动识别失败（{why}；{why2}）"
-                             "→ **未识别到型号，请人工选择**")
-            else:
-                profile = named_profile(profiles, name)
-                ident = f"自动识别型号「{name}」（{why}）"
-                ident_source = IDENT_AUTO
-        else:
-            # 外圈常规定位失败 -> 指纹失去径向基准，改用**孔型（几何量）**识别。
-            # 只认唯一匹配：多个型号都像 / 一个都不像，都不猜。
-            name, why = identify_by_bolts(sm, profiles)
-            if name is None:
-                raise MeasureError(_outer_fail_message(img, outer_fail)
-                                   + f"\n孔型识别也没能定型号：{why}")
-            profile = named_profile(profiles, name)
-            ident = f"外圈对比度低，按孔型识别型号「{name}」（{why}）"
-            ident_source = IDENT_BOLTS
+        # 没有指定型号就**不猜**（2026-10-23 删掉自动识别之后只剩这一条路）：
+        # 本次只给像素、结果标未验证，让操作员在界面里选或命令行 --profile。
+        # 绝不"按某个型号测"——那会拿错型号的标称值和 mm/px 给出一个理直气壮的错读数。
+        ident = "没有指定型号（自动识别已删除）→ 请人工选择型号；本次只给像素"
     # --mm-per-px 是"本次测量用这个系数"，检测里用到系数的路径（如 dark_core 的搜索带）
     # 也必须跟着走，否则报告和检测会用两套比例。回归门靠它把系数钉死。
     if args.mm_per_px and profile:
@@ -434,9 +301,6 @@ def measure(img: np.ndarray, args) -> RingResult:
     _p(f"时间: {timestamp.strftime('%Y-%m-%d %H:%M:%S')}    图像: {src_desc}")
     _p(f"型号: {profile['_name'] if profile else '未确定（无档案）'}    {ident}")
     _p(f"      定位={loc} 边界={bnd}")
-    if fp_missing:
-        _p(f"    注：型号「{'、'.join(fp_missing)}」还没有指纹，不参与自动识别"
-           "（用 --save-fingerprint 建档，见 models/fingerprints/）")
     if ident_source == IDENT_UNIDENTIFIED:
         _p("⚠️  **未识别到型号**：没有本型号的标称值与换算系数，本次**只给像素、不给毫米**。")
         _p("    请人工确认零件型号后重测：界面上在「型号」里选，或命令行 --profile <型号名>。")
@@ -597,9 +461,6 @@ def main():
     args = build_parser().parse_args()
     try:
         img = grab_image(args)
-        if args.save_fingerprint:
-            build_fingerprint(args, img)          # 只建指纹，不测量、不出报告
-            return
         result = measure(img, args)
     except MeasureError as e:
         raise SystemExit(str(e)) from None
