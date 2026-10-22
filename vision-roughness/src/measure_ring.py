@@ -231,9 +231,23 @@ def measure(img: np.ndarray, args) -> RingResult:
     for e in edges:
         tag = "外缘" if e["pol"] is None else concentric.POLARITY_NAME[e["pol"]]
         mm = "" if ratio is None else f"  {e['dia_px'] * ratio:8.3f} mm"
+        lvl = concentric.STRENGTH_NAME[e["strength"]]
         _p(f"  #{e['idx']:<3d} {e['dia_px']:9.1f} px{mm}  "
            f"椭圆 {e['a1']:.1f}x{e['a2']:.1f} 角{e['ang']:.1f}°"
-           f"  [{tag}  点 {e['n']}/{e['n_ray']}]")
+           f"  [{tag}  点 {e['n']}/{e['n_ray']}  强度 {lvl} 落差 {e['step']:.0f}]")
+
+    # 边强度汇总：回答"**这张图的边整体强不强**"，不是"哪条是真边"
+    n_strong = sum(1 for e in edges if e["strength"] == 2)
+    n_mid = sum(1 for e in edges if e["strength"] == 1)
+    n_weak = sum(1 for e in edges if e["strength"] == 0)
+    _p(f"\n边强度汇总：强 {n_strong} / 中 {n_mid} / 弱 {n_weak}"
+       f"（落差 ≥{concentric.STRONG_STEP:.0f} 灰阶为强、<{concentric.WEAK_STEP:.0f} 为弱）")
+    if edges and n_strong == 0:
+        worst = max(e["step"] for e in edges)
+        _p(f"⚠️  本图没有强边（最大落差 {worst:.0f} 灰阶）——多半是低对比度/欠曝/离焦，先补光或重对焦。")
+        _p("    强度只说明边在图像里显不显眼，**不代表它是不是你要量的尺寸**，别靠它判真假；")
+        _p("    但整张图都弱时位置精度明显变差，这类读数不确定度大于 ±1.4%。")
+        warnings.append("本图没有强边（整体对比度低）：先补光/对焦，读数不确定度更大")
     if len(edges) <= 1:
         _p("（只找到外缘：这件零件没有检出同心内边——实心光滑盘就是这样）")
 

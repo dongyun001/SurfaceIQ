@@ -23,7 +23,7 @@ import sys
 import numpy as np
 
 from fit_ellipse_ring import (
-    N_RAY, edge_ok, filter_and_fit, find_edge_points, find_outer,
+    N_RAY, edge_ok, filter_and_fit, find_edge_points, find_outer, ray_profile,
 )
 
 # ---------------- 扫描参数 ----------------
@@ -37,6 +37,19 @@ LIST_BAND_STEP = 0.025    # 相邻带的步进（×外圈半径）
 LIST_MIN_GRAD = 1.2       # 亚像素找边的梯度门槛：宁可多列，靠"支撑点数"让人看出哪条虚
 LIST_MERGE_TOL = 0.012    # 同极性、半径差在此比例内视为同一条边（×外圈半径）
 OUTER_LOW_GRAD = 0.8      # 外圈低对比度重试用的梯度门槛（默认是 2.0，见 find_outer）
+
+# ---- 边强度分级（"主次区分"的落地方式）----
+# 用**跨边的亮度落差**（灰阶，中位；在 σ=5 平滑图上量，与找边用同一张图）分级。
+# 阈值取在实测间隙里：零件1 的 6 条真边 **90~133**；零件2 的 17 条（车削纹路/明暗带）**7~32**。
+# ⚠️ 这两个门槛只在**两个零件**上定过，拿到第三种件必须复核——**别为了让某张图好看去调它**。
+# 分级只说明"这条边在图像里有多显眼"，**不代表它是不是你要量的尺寸**：低对比度件的边会全是"弱"，
+# 那正是该补光/对焦的信号，不是判真假的依据。
+# 实测反例（很重要）：零件2 的外缘——它唯一要量的边——陡度 3.5 是 17 条里**最低**的（缓坡），
+# 而"纹路边"陡度反而 11~20。所以**没有任何单一指标能自动挑出"尺寸边"**；要做到那一步，
+# 得先统一"外缘取法"（外缘是一条有厚度的带），那是另一个量级的工程。
+STRONG_STEP = 80.0        # 落差 ≥ 此值 → 强
+WEAK_STEP = 20.0          # 落差 <  此值 → 弱
+STRENGTH_NAME = ("弱", "中", "强")
 
 # 极性 -> 人看的说法（报告与界面都用这句，别在两处各写一遍）
 POLARITY_NAME = {-1: "亮→暗", +1: "暗→亮"}
@@ -132,8 +145,46 @@ def list_concentric(img, init_c=None, init_r=None):
             "n": m["n"], "n_ray": N_RAY, "pol": m["pol"], "votes": m["votes"],
             "src": "scan",
         })
+    for e in edges:                       # 给每条边补"强度"三个字段（报告/图/界面都用）
+        step, grad = _edge_strength(sm, e)
+        e["step"] = step
+        e["grad"] = grad
+        e["strength"] = classify_strength(step)
     return {"outer": outer, "fail": None, "center": (ocx, ocy),
             "r_outer": r_outer, "edges": edges, "low_contrast": low_contrast}
+
+
+def _edge_strength(sm, e, n_ray=N_RAY):
+    """跨这条边的亮度落差（灰阶，中位）+ 带内最大梯度（陡度）。
+
+    落差 = 边两侧平台的中位灰度差，取样离边 `max(6px, 1.2%r)` —— 要跨过缓坡，
+    贴着边走量到的是坡本身，不是落差。陡度用逐射线最大 |梯度| 的中位。
+    """
+    r, cx, cy = e["r_px"], e["cx"], e["cy"]
+    off = max(6.0, 0.012 * r)
+    steps, grads = [], []
+    for k in range(n_ray):
+        ang = 2 * np.pi * k / n_ray
+        d, prof = ray_profile(sm, cx, cy, ang, r + off * 1.6)
+        inner = prof[(d >= r - off) & (d <= r - off * 0.6)]
+        outer = prof[(d >= r + off * 0.6) & (d <= r + off)]
+        if len(inner) >= 4 and len(outer) >= 4:
+            steps.append(abs(float(np.median(outer)) - float(np.median(inner))))
+        m = (d >= r - off) & (d <= r + off)
+        gi = prof[m]
+        if len(gi) > 8:
+            grads.append(float(np.max(np.abs(np.gradient(gi)))))
+    return ((float(np.median(steps)) if steps else 0.0),
+            (float(np.median(grads)) if grads else 0.0))
+
+
+def classify_strength(step):
+    """落差 -> 0/1/2（弱/中/强）。只说明"在图像里多显眼"，不说明是不是你要量的尺寸。"""
+    if step >= STRONG_STEP:
+        return 2
+    if step >= WEAK_STEP:
+        return 1
+    return 0
 
 
 def _main(argv):

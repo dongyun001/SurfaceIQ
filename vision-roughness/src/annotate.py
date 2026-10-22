@@ -120,8 +120,12 @@ def draw_listing(img, res, ratio=None):
     h, w = out.shape[:2]
 
     for e in edges:                            # 每条边先画出它自己的椭圆
+        # 线宽按**边强度**分级（弱 2 / 中 3 / 强 6）：低对比度件整张图会全是细线，
+        # 一眼就能看出"这帧的边都很弱"，不用去读数字。
+        lvl = e.get("strength", 2)
+        w = 6 if lvl == 2 else (3 if lvl == 1 else 2)
         cv2.ellipse(out, ((e["cx"], e["cy"]), (e["a1"], e["a2"]), e["ang"]),
-                    _edge_color(e), 4)
+                    _edge_color(e), w)
 
     for idx, text, text_x, base_y, (ax, ay) in _place_labels(edges, ratio, w, h):
         e = edges[idx - 1]

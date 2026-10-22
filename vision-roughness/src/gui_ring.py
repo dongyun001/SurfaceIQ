@@ -554,9 +554,12 @@ class MeasureWindow:
         for e in r.edges[1:]:                       # #1 已经在大字里了
             mm = (f"{e['dia_px'] * r.ratio:9.3f} mm" if r.ratio is not None else "      (px)")
             tag = POLARITY_CN.get(e["pol"], "")
+            lvl = ("弱", "中", "强")[e.get("strength", 2)]
             tk.Label(self.list_frame,
-                     text=f"#{e['idx']:<3d} {e['dia_px']:8.1f} {mm}  {tag}  点{e['n']}",
-                     font=(self.ui, 12), bg=COLOR_BG, fg=COLOR_TEXT,
+                     text=f"#{e['idx']:<3d} {e['dia_px']:8.1f} {mm}  {tag}  "
+                          f"{lvl}  落差{e.get('step', 0):.0f}",
+                     font=(self.ui, 12), bg=COLOR_BG,
+                     fg=COLOR_MUTED if e.get("strength") == 0 else COLOR_TEXT,
                      anchor="w").pack(anchor="w")
         if len(r.edges) <= 1:
             tk.Label(self.list_frame, text="（只找到外缘：没有同心内边）",
