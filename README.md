@@ -74,7 +74,7 @@ venv\Scripts\python.exe -c "import cv2, numpy; print(cv2.__version__, numpy.__ve
 
 ```bash
 venv\Scripts\python.exe src\measure_ring.py                          # 相机现拍并测量
-venv\Scripts\python.exe src\measure_ring.py --image ..\data\captures\capture_20260908_115557.jpg
+venv\Scripts\python.exe src\measure_ring.py --image <图片路径>        # 测已有照片（图放 data/captures/）
 venv\Scripts\python.exe src\measure_ring.py --profile 型号1-6孔圆环 --ref-mm 88.60   # 标定该型号
 venv\Scripts\python.exe src\measure_ring.py --image xxx.jpg --profile 型号2-4孔圆盘   # 按型号档案测
 ```
@@ -128,8 +128,8 @@ venv\Scripts\python.exe src\measure_ring.py --image xxx.jpg --profile 型号2-4�
 > 归一化展开让尺度/亮度/对比度变化都不影响匹配，循环互相关让旋转不影响匹配——全程无量纲，
 > 所以不需要 mm/px，也不会和"按型号存系数"循环依赖。指纹存在
 > `models/fingerprints/<型号名>.npz`（**入库**；参考图默认不入库——`data/captures/` 被忽略，
-> 例外只有 AGENTS.md §3 的回归夹具图（§4 有入库例外的写法要求），
-> 换参考图/换机位/换光照/换镜头都要重新生成），`<型号名>.png` 是给人核对的预览。
+> 夹具图是唯一的入库例外，见 AGENTS.md §4，
+> 换参考图/换机位/换光照/换镜头都要重新生成）。`.png` 预览 2026-10-23 已删。
 >
 > **只在明确命中时才认**：最高分要够高、还要和次高分拉开差距，否则**拒绝**并说明。
 > **2026-10-22 补第二判据**：指纹认不出（跨光照/跨机位）时，再用**孔型（几何量）**认一次——
@@ -191,6 +191,8 @@ venv\Scripts\python.exe src\measure_ring.py --image xxx.jpg --profile 型号2-4�
 ## 实测数据（2026-09-14 拍；2026-10-08 按卡尺真值订正）
 
 输入**仓库根**的 `data/captures/capture_20260908_115557.jpg`（12MP，斜视）。
+⚠️ **这张夹具图已于 2026-10-23 删除**（机位判定过时，等重拍）——取回办法见 `AGENTS.md` §3 末。
+所以本节往下都是**历史记录**，不是能直接复现的现状。
 **px 是硬读数**；这张图检出的外径/中心孔/各螺栓孔 px、以及它们的期望值，见 **`AGENTS.md` §3
 的回归用例 1**——那里是数值的**唯一真相源**，本文不再抄一份（两处抄同一批数，迟早对不上）。
 
@@ -312,7 +314,7 @@ SurfaceIQ/
 │   │   └── explore_ring.py / profile_ring.py / ray_ring.py / edge_ring.py
 │   │                            开发期图像诊断工具（见文末）
 │   ├── models/part_profiles.json 型号档案（标称值 / 孔数 / 孔位角度 / 各型号 mm/px）
-│   ├── models/fingerprints/     型号识别指纹（<型号名>.npz 指纹 + .png 预览，**入库**）
+│   ├── models/fingerprints/     型号识别指纹（<型号名>.npz 指纹，**入库**）
 │   ├── debug/                   每次测量的调试图 + 文字报告 + GUI 日志（未入库）
 │   ├── data/captures/           采集的图片（未入库）
 │   ├── temp/hik_debug.py        海康取图故障排查脚本
@@ -388,7 +390,7 @@ SurfaceIQ/
    ```
 
    生成的 `models/fingerprints/<型号名>.npz` **要提交进仓库**——参考图在 `data/captures/`
-   不入库，指纹是自动识别的唯一凭据。旁边那张 `<型号名>.png` 是给人核对的预览。
+   不入库，指纹是自动识别的唯一凭据。
 
 ---
 

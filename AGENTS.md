@@ -56,10 +56,13 @@
   （与别的程序同时开会撞 `0x80000203`）。CLI 不阻塞、也能走相机现拍（不传 `--image`），
   所以**能用 CLI 验证的就别开 GUI**。
 
-## 3. 验收合约（回归）
+## 3. 验收合约（回归）—— **2026-10-23 起暂停：没有夹具图，就没有回归门**
 
 **项目没有测试框架**（无 pytest / unittest / `def test_`）。改动检测相关代码后，
-**下面两条都要跑**（cwd 一律 `vision-roughness/`）：
+**下面两条都要跑**（cwd 一律 `vision-roughness/`）——
+但 2026-10-23 用户判定旧夹具（2026-09/10 那个机位）已过时，**全部图片素材已删除、等重拍**。
+所以**本节当前是停用状态：没有回归门，任何改动一律等于「未验证」**，别以为跑过就算数。
+旧夹具随时能取回，办法见本节末。
 
 ```bash
 venv\Scripts\python.exe src\measure_ring.py --profile 型号1-6孔圆环 --image ..\data\captures\capture_20260908_115557.jpg
@@ -74,7 +77,8 @@ venv\Scripts\python.exe src\measure_ring.py --profile 型号2-4孔圆盘 --mm-pe
 
 **一条用例 = 一张参考图 + 它对应的档案**（不是"一个型号一条"：同型号换机位再拍一张，像素读数就变）。
 两条用例覆盖**两条互不相干的检测路径**（`template_ngon`+`countersink_rim` / `profile_angles`+`dark_core`），
-**缺一条就等于漏一半**。两张夹具图都随仓库提交，新克隆能跑全。
+**缺一条就等于漏一半**。⚠️ **这段设计说明属于旧路径**：通用量测模式落地后要按新的检测形态重写
+（见 `docs/通用量测模式计划.md`）。夹具图原先是随仓库提交的，现已删除。
 
 **判据只有两条**：
 
@@ -85,7 +89,8 @@ venv\Scripts\python.exe src\measure_ring.py --profile 型号2-4孔圆盘 --mm-pe
 
 `换算系数:` 那行的来源标签、`型号:` / `定位=` / `边界=` 这几行是可追溯信息，不参与比对。
 
-**期望值（px；外圈行给椭圆轴长，内圈/各孔行给均值直径）**：
+**期望值（px；外圈行给椭圆轴长，内圈/各孔行给均值直径）—— 历史基线，仅在取回旧夹具时对照；
+重拍后要重新定版（见 `docs/通用量测模式计划.md` §8）**：
 
 | 用例 | 外圈椭圆 | 中心孔 | 内圈 | 各孔 |
 |---|---|---|---|---|
@@ -98,6 +103,15 @@ venv\Scripts\python.exe src\measure_ring.py --profile 型号2-4孔圆盘 --mm-pe
 **重标系数**用 `--profile <型号> --image <该机位的图> --ref-mm <真值>` 让工具自己算，**别手算**：
 手算容易用四舍五入后的 px 而不是内部值（正是 `fe33d3a` 那条"别让第三位小数漂移"）。
 
+**取回旧夹具**（随时可做，它们在 tag `pre-concentric` 与提交历史里）：
+
+```bash
+git checkout pre-concentric -- data/captures/capture_20260908_115557.jpg vision-roughness/data/captures/capture_single_20261007_203729.jpg
+```
+
+取回后本节的两条用例就能跑；跑完记得不要再提交它们，除非你重新把它们定为回归夹具
+（那时按 §4 在 `.gitignore` 里 `!` 出来）。
+
 ## 4. 不可动 / 不入库 / 明确禁止
 
 - **不许为了让读数对上标称值去改 `od_mm` / `mm_per_px`**（`models/part_profiles.json`）。
@@ -106,9 +120,10 @@ venv\Scripts\python.exe src\measure_ring.py --profile 型号2-4孔圆盘 --mm-pe
   而且属于"上次标定的某个型号"。现在系数只存在型号档案里；查不到就**只报像素、不给毫米**。
 - **不入库**（`.gitignore`）：`debug/`、`vision-roughness/data/captures/*`、`venv/`、`.zcode/`、
   `**/temp/*`（仅保留 `hik_debug.py`）、`**/models/*.pth`。运行时产物别 `git add`。
-- **入库的参考数据**：`models/part_profiles.json`、`models/fingerprints/*.npz`（+ `.png` 预览）。
+- **入库的参考数据**：`models/part_profiles.json`、`models/fingerprints/*.npz`。
   指纹**必须入库**——它的参考图不入库，指纹是自动识别的唯一凭据。
-- **`data/captures/` 的例外只有回归夹具**（§3 那两张，`.gitignore` 里用 `!` 单列）。
+  （`.png` 预览原先也入库，2026-10-23 随图片清空已删。）
+- **`data/captures/` 现在没有任何例外**（旧回归夹具 2026-10-23 已删，等重拍）。
   以后再加夹具图照此办理：**在 `.gitignore` 里显式 `!` 出来，不要用 `git add -f`**（后者会留下
   "已跟踪但仍被忽略"的状态，后人 grep 时看不出是故意的）。
 - **`测量.bat` 内容必须 ASCII + CRLF**（内部走 `pythonw` + `gui_ring.py`），存成 UTF-8 或 LF 会让 cmd 报错。
