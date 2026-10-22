@@ -353,6 +353,15 @@ class MeasureWindow:
                                 bg=COLOR_CANVAS, highlightthickness=1,
                                 highlightbackground="#cfd8dc")
         self.canvas.pack()
+        # 缩放/平移状态（结果图的"看细节"用；实时取景不受影响）
+        self.full_img = None          # 结果的全分辨率标注图
+        self._zoom = 1.0
+        self._cx = self._cy = 0.0     # 视图中心（原图坐标）
+        self._frozen = False          # True = 画面上冻结着一次结果（预览不许冲掉它）
+        self._drag = None
+        self.canvas.bind("<ButtonPress-1>", self._on_drag_press)
+        self.canvas.bind("<B1-Motion>", self._on_drag_move)
+        self.canvas.bind("<MouseWheel>", self._on_wheel)
         self.canvas_text = self.canvas.create_text(
             self.view_w // 2, self.view_h // 2, text="正在打开相机…",
             font=(self.ui, 13), fill="#9ca3af")
@@ -379,6 +388,9 @@ class MeasureWindow:
         self.btn_big.pack(side="left")
         self.btn_rep = self._button(btns, "打开报告", self.open_report)
         self.btn_rep.pack(side="left", padx=8)
+        self._button(btns, "放大 +", lambda: self._zoom_by(1.25)).pack(side="left")
+        self._button(btns, "缩小 −", lambda: self._zoom_by(1 / 1.25)).pack(side="left", padx=6)
+        self._button(btns, "复位", self._zoom_reset).pack(side="left")
         self._button(btns, "关闭 (Esc)", self.root.destroy).pack(side="right")
 
         # 显示增强：只改画面亮度，不改测量用的像素值。
@@ -450,6 +462,7 @@ class MeasureWindow:
         self.src.boost = bool(self.var_boost.get())
 
     def do_measure(self):
+        self._frozen = False
         if not self.src.is_ready() or self._measuring:
             return                          # 相机没就绪，或上一次还没测完
         self._measuring = True
@@ -470,6 +483,7 @@ class MeasureWindow:
         self.src.set_paused(not self.src.is_paused())
         self._sync_pause_button()
         if not self.src.is_paused():
+            self._frozen = False        # 恢复取景就解冻，否则预览会被冻结的结果图挡住
             self._set_status("取景中", COLOR_BUSY)
             self.canvas.itemconfig(self.canvas_text, text="正在取景…", state="normal")
 
@@ -490,7 +504,7 @@ class MeasureWindow:
             buf = self.src.preview_q.get_nowait()
         except queue.Empty:
             buf = None
-        if buf is not None:
+        if buf is not None and not self._frozen:
             self._show_image(buf)
             if self.src.fps > 0 and not self.src.is_paused():
                 self.lbl_fps.config(text=f"{self.src.fps:.1f} fps")
@@ -573,8 +587,9 @@ class MeasureWindow:
         else:
             self._show_message(None)
 
-        if thumb is not None:
-            self._show_image(thumb)
+        self.full_img = r.debug_img
+        self._frozen = True
+        self._zoom_reset()          # 新结果从"整图铺满"开始
         self.canvas.itemconfig(self.canvas_text, state="hidden")
 
         self.btn_again.config(state="normal")
@@ -585,6 +600,53 @@ class MeasureWindow:
         self.lbl_foot.config(
             text=f"图像: {r.src_desc}    {coef}"
                  f"    帧率: {self.src.fps:.1f} fps\n报告: {r.report_txt}")
+
+    def _zoom_by(self, factor):
+        """按倍数缩放结果图。只在"冻结着一次结果"时有效（实时取景不缩放）。"""
+        if self.full_img is None:
+            return
+        self._zoom = min(8.0, max(0.2, self._zoom * factor))
+        self._render_zoom()
+
+    def _zoom_reset(self):
+        if self.full_img is None:
+            return
+        self._zoom = 1.0
+        h, w = self.full_img.shape[:2]
+        self._cx, self._cy = w / 2.0, h / 2.0
+        self._render_zoom()
+
+    def _on_wheel(self, ev):
+        self._zoom_by(1.2 if ev.delta > 0 else 1 / 1.2)
+
+    def _on_drag_press(self, ev):
+        self._drag = (ev.x, ev.y)
+
+    def _on_drag_move(self, ev):
+        if self._drag is None or self.full_img is None:
+            return
+        self._cx -= (ev.x - self._drag[0]) / self._zoom
+        self._cy -= (ev.y - self._drag[1]) / self._zoom
+        self._drag = (ev.x, ev.y)
+        self._render_zoom()
+
+    def _render_zoom(self):
+        """从全分辨率标注图里裁一块、缩放到画布大小——这就是缩放/平移的全部实现。"""
+        if self.full_img is None:
+            return
+        h, w = self.full_img.shape[:2]
+        vw, vh = self.view_w, self.view_h
+        cw = min(w, max(32, int(round(vw / self._zoom))))
+        ch = min(h, max(32, int(round(vh / self._zoom))))
+        x0 = max(0, min(int(round(self._cx - cw / 2)), w - cw))
+        y0 = max(0, min(int(round(self._cy - ch / 2)), h - ch))
+        self._cx, self._cy = x0 + cw / 2.0, y0 + ch / 2.0
+        crop = self.full_img[y0:y0 + ch, x0:x0 + cw]
+        interp = cv2.INTER_AREA if cw > vw else cv2.INTER_LINEAR
+        view = cv2.resize(crop, (vw, vh), interpolation=interp)
+        ok, buf = cv2.imencode(".png", view)
+        if ok:
+            self._show_image(buf.tobytes())
 
     def _render_error(self, exc):
         self._set_status("出错", COLOR_NG)

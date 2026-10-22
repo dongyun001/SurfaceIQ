@@ -92,7 +92,8 @@ class RingResult:
     outer_px: float                 # 最外那条边（#1）的均值直径
     outer_ellipse: tuple
     outer_mm: Optional[float]
-    edges: list                     # [{idx, dia_px, r_px, a1, a2, ang, cx, cy, n, n_ray, pol, votes, src}]
+    edges: list                     # **要报的**清单（默认只含强边 + 外缘）
+    hidden: int = 0                 # 检出但没列的弱/中边条数（默认隐藏，见 --all-edges）
     tilt: float = 1.0
     touches_border: bool = False
     warnings: list = field(default_factory=list)
@@ -109,6 +110,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--ref-mm", type=float,
                    help="零件外径卡尺真值(mm)，用于标定**机位**的换算系数（会写回 models/rig.json）")
     p.add_argument("--mm-per-px", type=float, help="直接指定 mm/px（临时用，不写回档案）")
+    p.add_argument("--all-edges", action="store_true",
+                   help="连'弱边'一起列。默认只列强边（+外缘）——弱边在低对比度件上**不稳定**"
+                        "（实测连拍 5 帧条数在 11~15 之间跳、直径极差 7~11%%），列出来会误导人")
     return p
 
 
@@ -185,7 +189,14 @@ def measure(img: np.ndarray, args) -> RingResult:
     low_contrast = bool(res.get("low_contrast"))
     (ocx, ocy), (oa1, oa2), oang = outer
     outer_dia_px = (oa1 + oa2) / 2
-    edges = res["edges"]
+    detected = res["edges"]
+    # 只报"强边 + 外缘"：弱边在低对比度件上时隐时现（实测连拍 5 帧条数 11~15 跳、直径极差 7~11%），
+    # 列出来等于给人一堆不可复现的数。--all-edges 才全列。
+    if args.all_edges:
+        edges = detected
+    else:
+        edges = [e for e in detected if e["strength"] == 2 or e["src"] == "outer"]
+    hidden = len(detected) - len(edges)
 
     lines: list = []
     warnings: list = []
@@ -242,6 +253,9 @@ def measure(img: np.ndarray, args) -> RingResult:
     n_weak = sum(1 for e in edges if e["strength"] == 0)
     _p(f"\n边强度汇总：强 {n_strong} / 中 {n_mid} / 弱 {n_weak}"
        f"（落差 ≥{concentric.STRONG_STEP:.0f} 灰阶为强、<{concentric.WEAK_STEP:.0f} 为弱）")
+    if hidden:
+        _p(f"另有 {hidden} 条中/弱边**未列**（低对比度下它们不稳定，加 --all-edges 可看）")
+        warnings.append(f"另有 {hidden} 条弱边未列（不稳定）；见 --all-edges")
     if edges and n_strong == 0:
         worst = max(e["step"] for e in edges)
         _p(f"⚠️  本图没有强边（最大落差 {worst:.0f} 灰阶）——多半是低对比度/欠曝/离焦，先补光或重对焦。")
@@ -256,7 +270,8 @@ def measure(img: np.ndarray, args) -> RingResult:
            "读数的不确定度主要来自'外缘是一条有厚度的带'，实测约 ±1.4%")
 
     # ---- 标注图 + 报告落盘 ----
-    dbg = annotate.draw_listing(img, res, ratio)
+    keep_ids = {e["idx"] for e in edges}
+    dbg = annotate.draw_listing(img, res, ratio, label_filter=lambda e: e["idx"] in keep_ids)
     DEBUG_DIR.mkdir(exist_ok=True)
     dbg_path = DEBUG_DIR / "measure_ring_debug.jpg"
     if not cv2.imwrite(str(dbg_path), dbg):     # 路径是 ASCII，但仍判返回值
@@ -269,6 +284,7 @@ def measure(img: np.ndarray, args) -> RingResult:
     return RingResult(
         src_desc=src_desc, timestamp=timestamp, ratio=ratio, ratio_src=ratio_src,
         outer_px=outer_dia_px, outer_ellipse=outer, outer_mm=od_mm, edges=edges,
+        hidden=hidden,
         tilt=tilt, touches_border=touches_border, warnings=warnings, lines=lines,
         debug_jpg=dbg_path, report_txt=rep_path, debug_img=dbg,
     )

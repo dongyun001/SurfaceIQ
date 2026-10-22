@@ -106,10 +106,12 @@ def _place_labels(edges, ratio, w, h):
             for it in items]
 
 
-def draw_listing(img, res, ratio=None):
+def draw_listing(img, res, ratio=None, label_filter=None):
     """在图上画出 `concentric.list_concentric` 的清单，返回标注好的图（新数组）。
 
     ratio 给了就把 mm 也写进标签（mm = px × 系数）。清单为空时返回原图的副本。
+    `label_filter` 决定**哪些边打标签**（圆照样全画，弱边是细线）——默认只标要报的那几条，
+    免得把不稳定弱边的数字也印上去。
     """
     out = img.copy()
     if out.ndim == 2:
@@ -119,6 +121,7 @@ def draw_listing(img, res, ratio=None):
         return out
     h, w = out.shape[:2]
 
+    labeled = [e for e in edges if label_filter is None or label_filter(e)]
     for e in edges:                            # 每条边先画出它自己的椭圆
         # 线宽按**边强度**分级（弱 2 / 中 3 / 强 6）：低对比度件整张图会全是细线，
         # 一眼就能看出"这帧的边都很弱"，不用去读数字。
@@ -127,7 +130,7 @@ def draw_listing(img, res, ratio=None):
         cv2.ellipse(out, ((e["cx"], e["cy"]), (e["a1"], e["a2"]), e["ang"]),
                     _edge_color(e), w)
 
-    for idx, text, text_x, base_y, (ax, ay) in _place_labels(edges, ratio, w, h):
+    for idx, text, text_x, base_y, (ax, ay) in _place_labels(labeled, ratio, w, h):
         e = edges[idx - 1]
         col = _edge_color(e)
         (tw, th), _ = cv2.getTextSize(text, FONT, FONT_SCALE, FONT_THICK)
