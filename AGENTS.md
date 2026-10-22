@@ -142,23 +142,22 @@ git checkout pre-concentric -- data/captures/capture_20260908_115557.jpg vision-
 紧固件暗芯、精度天花板、没档案不许编毫米……）在 `README.md` 的「限制」一节，不在这里重复。
 
 - **`cv2.imread` / `cv2.imwrite` 遇中文路径不报错**：`imread` 返回 `None`、`imwrite` 返回 `False`
-  （只往 stderr 打一行 WARN）。本项目报告/指纹预览的文件名就是中文——**读要判空、写要用
+  （只往 stderr 打一行 WARN）。本项目的报告文件名就是中文——**读要判空、写要用
   `cv2.imencode` + `tofile`**。
 - **`find_edge_points` 的梯度算在未平滑的原始径向剖面上**。要加平滑就是**改所有读数**
   （堆 `(n_ray,L)` 配 `(1,7)` 是沿剖面平滑、配 `(7,1)` 是跨射线平滑，两者都会动外径/孔径），
   属于测量定义变更，**不要顺手混进清理提交**。
-- **mm/px 是"机位"的属性**：换相机高度/距离/倾角后 mm 会整体偏，必须对该型号重标；
-  像素读数不受影响。（实测同一天内三套机位，外圈长轴 2826.7 / 2650 / 2868px。）
-- **中心孔的偏差是无量纲比值，改系数救不了**：若检出的是"外圈半径的某个比例"变了，
-  调 `mm_per_px` 只会等比缩放，改不了比例。遇到"比例不对"要先怀疑**锁错了哪条圆**，
+- **mm/px 是"机位"的属性**：换相机高度/距离/倾角/曝光后 mm 会整体偏，必须**重标机位**
+  （`--ref-mm`，写回 `models/rig.json`）；像素读数不受影响。
+  （实测同一天内三套机位，外圈长轴 2826.7 / 2650 / 2868px。）
+- **孔径/内圈的偏差是无量纲比值，改系数救不了**：若检出的是"外圈半径的某个比例"变了，
+  调 `mm_per_px` 只会等比缩放，改不了比例。遇到"比例不对"要先怀疑**锁错了哪条边**，
   不是标定。详见 `docs/已知缺陷.md`。
 - **外缘是一条"有厚度的带"**（倒角/圆角 + 斜视下有的角度亮、有的暗）：所以**同一个零件转个角度，
-  检出的外径会变**（实测 47° 时 +2.5%），拟合椭圆会落到带的不同位置。任何"以检出外圈为基准"的
-  东西都要考虑这件事。
-- **`--spec-*` 一个都不给时"综合判定: OK"不是合格判定**，只是"未判定"的默认串
-  （`overall_judged=False`，GUI 显示「已测量」）。现在**判定只认命令行传的 `--spec-*`**，
-  档案里的 `od_mm`/`id_mm` 还没接进判定——别误以为档案填了标称值就会自动判 OK/NG。
-
+  检出的外径会变**（实测 47° 时 +2.5%），拟合椭圆会落到带的不同位置。
+  2026-10-23 又量到更硬的一条：**同一机位、两个真值已知的零件，反推的 mm/px 差 1.40%**
+  （0.044021 vs 0.044635），同一零件换量法也能差 0.9%。所以"一个机位常数"的**精度天花板
+  是 ±1.4%**，读数必须连不确定度一起显示，别当"5 丝量具"用。
 ## 6. 代码地图（改什么去哪改）
 
 - **换相机 / 曝光 / 增益**：只改 `src/config.py` 的 `CAMERA_TYPE` + `CAMERA_KWARGS`——
@@ -167,56 +166,38 @@ git checkout pre-concentric -- data/captures/capture_20260908_115557.jpg vision-
   实测孔壁比 0.630→0.618；**开机因此多等几秒**；要严格复现历史读数就 `auto_exposure=False`）。
 - **相机接入抽象层**：`src/camera_adapter.py`（`webcam` / `file` / `hikvision` 三实现，
   工厂函数 `create_camera()`），海康 DLL 搜索路径由它自动补。
-- **检测管线核心**：`src/fit_ellipse_ring.py`。几何算法都改这里。
-  - `find_outer(gray, init_c, init_r)` → `((椭圆, 点数) | None, σ=5 模糊图, 失败原因)`：
-    外圈定位，**识别与检测共用**（识别也要外圈椭圆；识别若复用 `detect()` 会把整条螺栓孔
-    管线白跑一遍）。失败原因是 `None` | `"out_of_frame"` | `"not_found"`，调用方据此给
-    具体提示，别退回笼统的「外圈拟合失败」。
-  - **外圈出画时不许锁到内孔**：`find_outer` 接受候选后会检查外面是否还有"更大且同心"的圆；
-    有、且它出画，就返回 `out_of_frame`。内孔是完美圆，`_outer_ok` 的三条判据全过，
-    只有这一条能揭穿它。守卫只在自适应路径生效（旧先验命中时 peaks 为空、不付开销）。
-  - **外缘对比度太低时**：只有档案写了 `outer_fallback: "bolt_anchor"` 的型号才启用
-    `_outer_from_bolts`——先用紧固件定圆心/朝向、按 `bolt_circle_ratio` 推期望半径，
-    再在 ±7% 窄带里**实测**外径（不能用孔圈比例反推，否则"外径不对"就检不出来）。只在
-    `find_outer` 失败时触发，正常图不进；报告/GUI 必须标「由紧固件锚定」。自动识别用不了
-    这条路（那时还不知道型号）。
-  - `detect(img, init_c, init_r, profile)` → `{"outer","center_hole","bolts","bolts_locate",
-    "bolts_boundary","bolts_unverified"}`。
-  - **外圈定位是自适应的**：`_outer_candidates` 给候选（旧先验排第一保基线，之后是
-    「候选圆心 × 径向峰半径 × 两种极性」），由 `_outer_ok` 判可信。**判据只用点数/轴比/画幅，
+- **几何内核**：`src/fit_ellipse_ring.py`（**只剩几何**，不含任何业务语义）。
+  - `find_edge_points(gray, cx, cy, r_lo, r_hi, polarity, min_grad, mode=...)`：沿射线找亚像素边
+    （`mode="steepest"` 取窗口内最陡梯度；`"outer_first"` 从外往里找第一条）。
+  - `filter_and_fit(pts, cx, cy, r0)`：圆等价归一化滤离群 + 椭圆拟合迭代。
+  - `find_outer(gray, init_c, init_r, min_grad=2.0)` → `((椭圆, 点数) | None, σ=5 模糊图, 失败原因)`。
+    失败原因 `None` | `"out_of_frame"` | `"not_found"`，调用方据此给具体提示。
+  - **外圈出画时不许锁到内孔**：`find_outer` 会检查外面是否还有"更大且同心"的圆，有且出画
+    就返回 `out_of_frame`。内孔是完美圆、`_outer_ok` 三条判据全过，只有这一条能揭穿它。
+  - **外圈定位是自适应的**：`_outer_candidates` 给候选（旧先验排第一，之后是
+    「候选圆心 × 径向峰半径 × 两种极性」），`_outer_ok` 判可信。**判据只用点数/轴比/画幅，
     不能用残差 RMS**（基线自身 41px、错误极性 40.6px，区分不开）。
-  - **中心孔定位也是自适应的**：`_inner_candidates` 给"多个比例带 × 两种极性"的候选，
-    `_inner_ok` 用点数+轴比+在外圈内+**与外圈同心**判可信。**旧档位排第一，且它的 r0 必须
-    严格用 0.70**（不是波段中点 0.69——圆等价滤点边界跟着 r0 走，差这一点读数就变；
-    这个坑是基线回归门抓出来的）。**档案有 `id_mm`/`od_mm` 时**，先用真值孔径比
-    （`id_mm/od_mm`）给一组窄带候选，带内取**最陡梯度**，再在"实测比落在 `INNER_RATIO_TOL` 内"
-    的候选里挑最接近的；没有真值才只走旧档位。**别改成"取缓坡最内侧像素"**——孔壁是约 0.02r
-    宽的缓坡，取坡脚会随窗口位置漂（实测 0.620~0.629 vs 最陡 0.630）。型号1 内圈有三圈
-    （55.9 / ~60 / ~78mm），只量最内侧；残差与依据见 `docs/已知缺陷.md` 缺陷 1。
-  - **内圈**：`_measure_inner_rings` 按档案 `inner_rings` 的 `mm/od_mm` 圈定窄带，正/负极性
-    各拟一条边、取**中点**；只做加性测量（找不到两条边标失败，不拿一条边硬充）。
-    型号1 的 ~60/~78 各是一道环形槽；近正对实测 +0.41% / +0.24%
-    （实测数据记在型号档案的 `inner_rings` 备注里）。
-  - **螺栓孔是"两个正交维度"的派发**（`LOCATE_FNS` / `BOUNDARY_FNS`），**所有型号平级**：
-    `locate`（怎么定位孔）= `profile_angles` | `template_ngon`；
-    `boundary`（量哪条边界）= `countersink_rim` | `dark_core`。
-    **新增形态 = 加一个策略函数（约 15 行），不碰 `detect()`**；
-    原来那条 `feature=countersink|core_hole` 一维枚举**已删除，别加回来**。
-  - **`ngon_slots` 的孔数来自档案 `bolt_count`**（缺省才从候选峰推断）；槽位没匹配到峰时按
-    等角假设**合成**坐标并标 `src="synthesized"`，**报告和 GUI 都必须标出来**（以前它和实测孔
-    长得一模一样）。
-  - **`bolts_unverified=True`** 表示档案缺 `locate`/`boundary`（或整个没给）、走了兜底：
-    此时**不许给毫米数**、结果要标「未经验证」。
-  - **中心孔没检出时螺栓孔照样跑**（环带用外圈椭圆，有中心孔就挖掉，没有就用整个盘面）。
+  - `edge_ok(ell, n, outer)`（原 `_inner_ok`）：同心边的可信判据——点数 ≥ 0.6×72 + 轴比合理
+    + 在外圈内 + **与外圈同心**。通用量测用它筛**每一条**边。
+  - **低对比度件**：梯度门槛默认 2.0（历史基线）；`concentric` 在 `not_found` 时用
+    `OUTER_LOW_GRAD = 0.8` **重试一次**，并把 `low_contrast` 标出来 → 报告必须写明
+    "不确定度大于 ±1.4%"。实测零件2 的外缘梯度中位正好 2.00，卡在门槛上。
+- **清单生成**：`src/concentric.py`。`list_concentric(img)` = 定圆心（借 `find_outer`）+
+  沿径向枚举「重叠候选带 × 两种极性」+ 亚像素找边 + `edge_ok` 筛 + 同极性合并 +
+  按半径由外向内编号。返回 `{outer, fail, center, r_outer, edges, low_contrast}`。
+  **它不命名、不判合格**——这是刻意的产品定位（见 `docs/通用量测模式计划.md`）。
+- **图上标注**：`src/annotate.py`。`draw_listing(img, res, ratio)` 画椭圆 + 编号 + 数值 + 引线。
+  三条硬约束：**图上文字只能 ASCII**（`cv2.putText` 画不了中文）；**存盘必须
+  `cv2.imencode` + `tofile`**（中文路径安全）；**标签必须沿整圈摊开**（挤成一列时引线会长到
+  上千像素，实测 1116px → 摊开后 42px）。
+- **换算系数只有一份**：`models/rig.json`（**机位级**）。`measure_ring.load_rig` / `save_rig`；
+  `--ref-mm` 标定后写回。**不许再出现第二份**——旧的 `models/mm_per_pixel.json`、以及曾经
+  "按型号各存一份 `mm_per_px`"（已随档案一起删除）都是因为这个退休的。
+  **不确定度 ±1.4%**：同机位两个零件反推系数实测差 1.40%，原因是外缘是一条有厚度的带。
 - **外圈定位失败时要说清原因**：`measure_ring.locate_fail_hint` 区分「画面太暗」/「画面过曝」/
   「其他」，别退回成一句笼统的「检查对焦、光照、零件是否在画面中心」。
-- **结果唯一来源**：`measure_ring.measure()` 产出 `RingResult`，CLI 打印它、GUI 显示它——
-  **不要在 `gui_ring.py` 里自己再算一遍尺寸**。
-- **型号档案是唯一入口**：`models/part_profiles.json`。字段：`od_mm` / `id_mm` /
-  `has_center_hole` / `bolt_mm` / `bolt_count` / `bolt_angles_rel`（相对角度，支持非等分）/
-  `bolt_circle_ratio` / `inner_rings`（`[{name, mm}]`，按两道边中点测）/
-  `outer_fallback`（可选 `bolt_anchor`，见下）/
-  `locate` / `boundary` / `mm_per_px`。
+- **结果唯一来源**：`measure_ring.measure()` 产出 `RingResult`（含 `edges` 清单），
+  CLI 打印它、GUI 显示它——**不要在 `gui_ring.py` 里自己再算一遍尺寸**。
 - **型号识别已于 2026-10-23 整体删除**（`polar_fingerprint` / `match_fingerprint` /
   `identify_by_bolts` / 全部 `FP_*` / `--save-fingerprint` / `models/fingerprints/*`）。
   **不传 `--profile` 就不再猜**：只给像素、不给毫米，让人在界面下拉框或命令行选型号。

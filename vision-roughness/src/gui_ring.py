@@ -48,17 +48,12 @@ from tkinter import messagebox, ttk  # noqa: E402
 
 import config  # noqa: E402
 from camera_adapter import create_camera  # noqa: E402
-from measure_ring import (IDENT_EXPLICIT, IDENT_NOPROFILE, IDENT_UNIDENTIFIED,
-                          MeasureError, build_parser, load_profiles,
-                          measure)  # noqa: E402
+from concentric import POLARITY_NAME as POLARITY_CN  # noqa: E402
+from measure_ring import MeasureError, build_parser, measure  # noqa: E402
 
 LOG_PATH = PROJECT_ROOT / "debug" / "gui_error.log"
 RUN_LOG = PROJECT_ROOT / "debug" / "gui_run.log"
 
-CIRCLED = "①②③④⑤⑥"
-PICK_NOPROFILE = "无档案试测（只给像素）"   # 下拉框的固定项（自动识别已于 2026-10-23 删除）
-IDENT_LABEL = {IDENT_EXPLICIT: "人工指定", IDENT_NOPROFILE: "无档案试测",
-               IDENT_UNIDENTIFIED: "未指定型号"}
 COLOR_BG = "#ffffff"
 COLOR_TEXT = "#111827"
 COLOR_MUTED = "#6b7280"
@@ -121,21 +116,6 @@ def pick_font(root) -> str:
 
 def _now() -> str:
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-
-
-def model_choices() -> list:
-    """型号下拉框的选项：档案里的型号 +「无档案试测」。
-
-    **没有"自动识别"这一项了**（2026-10-23 删除）：不选型号就只给像素、不猜。
-    读不到档案（文件缺失/损坏）也不能让窗口起不来：退回只剩固定项并记日志——
-    窗口是车间唯一的入口，宁可少几个选项也不能打不开。
-    """
-    names = []
-    try:
-        names = [k for k in load_profiles() if not k.startswith("_")]
-    except Exception as e:                  # noqa: BLE001
-        write_log(f"[{_now()}] 读型号档案失败，型号下拉框只保留固定项: {e}")
-    return names + [PICK_NOPROFILE]
 
 
 def _open_file(path):
@@ -356,26 +336,15 @@ class MeasureWindow:
         body = tk.Frame(root, bg=COLOR_BG)
         body.pack(fill="both", expand=True, padx=18, pady=(8, 0))
 
-        # 左列：数字
+        # 左列：最外那条（外缘）+ 同心边清单（条数不固定，所以是动态重建的 Frame）
         left = tk.Frame(body, bg=COLOR_BG)
         left.pack(side="left", anchor="n")
-        self.lbl_od = self._number_row(left, "外径", 40)
-        self.lbl_id = self._number_row(left, "中心孔", 30, pady=(6, 4))
-        self.inner_labels = []
-        for i in range(2):
-            self.inner_labels.append(
-                self._number_row(left, f"内圈{i+1}", 22, pady=(0, 3)))
-
-        tk.Label(left, text="螺栓孔口径（沉孔口，非螺纹孔径）", font=(self.ui, 11),
-                 bg=COLOR_BG, fg=COLOR_MUTED).pack(anchor="w")
-        bolts = tk.Frame(left, bg=COLOR_BG)
-        bolts.pack(anchor="w", pady=(2, 0))
-        self.bolt_labels = []
-        for i in range(6):
-            lbl = tk.Label(bolts, text=f"{CIRCLED[i]}—", font=(self.ui, 17, "bold"),
-                           bg=COLOR_BG, fg=COLOR_MUTED)
-            lbl.grid(row=i // 2, column=i % 2, sticky="w", padx=(0, 14), pady=1)
-            self.bolt_labels.append(lbl)
+        self.lbl_od = self._number_row(left, "外缘（#1）", 40)
+        tk.Label(left, text="同心边清单（按半径由外向内；不命名，请对照图纸判断）",
+                 font=(self.ui, 10), bg=COLOR_BG, fg=COLOR_MUTED).pack(anchor="w",
+                                                                      pady=(4, 2))
+        self.list_frame = tk.Frame(left, bg=COLOR_BG)
+        self.list_frame.pack(anchor="w")
 
         # 右列：实时取景画面
         right = tk.Frame(body, bg=COLOR_BG)
@@ -387,8 +356,8 @@ class MeasureWindow:
         self.canvas_text = self.canvas.create_text(
             self.view_w // 2, self.view_h // 2, text="正在打开相机…",
             font=(self.ui, 13), fill="#9ca3af")
-        tk.Label(right, text="绿=外圈   红=中心孔   品红=内圈   蓝=螺栓孔", font=(self.ui, 9),
-                 bg=COLOR_BG, fg=COLOR_MUTED).pack(pady=(4, 0))
+        tk.Label(right, text="绿=外缘   红=亮→暗边   品红=暗→亮边（编号与数值标在图上）",
+                 font=(self.ui, 9), bg=COLOR_BG, fg=COLOR_MUTED).pack(pady=(4, 0))
 
         # 提醒 / 报错区（默认不显示，有内容才 pack）
         self.msg_frame = tk.Frame(root, bg=COLOR_WARN_BG)
@@ -411,15 +380,6 @@ class MeasureWindow:
         self.btn_rep = self._button(btns, "打开报告", self.open_report)
         self.btn_rep.pack(side="left", padx=8)
         self._button(btns, "关闭 (Esc)", self.root.destroy).pack(side="right")
-
-        # 型号选择：默认自动识别（不传 --profile）。识别失败时在这里选，选完自动重测一次。
-        # 这是"人工选择"这条兜底路，不是数值计算——本文件照旧不碰任何读数（AGENTS.md §6）。
-        self.cmb_profile = None
-        try:
-            self._build_profile_picker(root)
-        except tk.TclError as e:
-            # 下拉框起不来不该拖垮整个窗口（车间入口）。少一个控件，测量照旧。
-            write_log(f"[{_now()}] 型号下拉框创建失败（不影响测量）: {e}")
 
         # 显示增强：只改画面亮度，不改测量用的像素值。
         # takefocus=0 —— 否则点过复选框后焦点留在它身上，空格会去切换复选框
@@ -448,38 +408,6 @@ class MeasureWindow:
         y = max(0, (root.winfo_screenheight() - h) // 4)
         root.geometry(f"+{x}+{y}")
         root.minsize(w, h)
-
-    def _build_profile_picker(self, root):
-        """型号下拉框（各型号 /「无档案试测」）。没有"自动识别"——不选就只给像素。"""
-        pick = tk.Frame(root, bg=COLOR_BG)
-        pick.pack(fill="x", padx=18, pady=(2, 0))
-        tk.Label(pick, text="型号:", font=(self.ui, 11), bg=COLOR_BG,
-                 fg=COLOR_TEXT).pack(side="left")
-        # takefocus=0：点过下拉框后焦点别留在它身上，否则空格会去开下拉菜单而不是测量
-        self.cmb_profile = ttk.Combobox(pick, state="readonly", width=22, takefocus=0,
-                                        values=model_choices(), font=(self.ui, 11))
-        # 默认「无档案试测」：不替操作员假定型号（自动识别已删，猜型号会给出理直气壮的错读数）
-        self.cmb_profile.set(PICK_NOPROFILE)
-        self.cmb_profile.pack(side="left", padx=(6, 8))
-        self.cmb_profile.bind("<<ComboboxSelected>>", self._on_profile_pick)
-        tk.Label(pick, text="（在这里选零件型号；不选就只给像素）", font=(self.ui, 9),
-                 bg=COLOR_BG, fg=COLOR_MUTED).pack(side="left")
-
-    def _on_profile_pick(self, _event=None):
-        """把下拉框的选择写进 self.args —— 与命令行的 --profile 完全同一套参数。
-
-        界面只决定"用哪个型号"，读数仍全部由 measure_ring.measure() 产出。
-        选完自动重测一次，省得操作员再按一次键。
-        """
-        if self.cmb_profile is None:
-            return
-        picked = self.cmb_profile.get()
-        if picked == PICK_NOPROFILE:
-            self.args.profile = "none"               # 与 --profile none 同一语义
-        else:
-            self.args.profile = picked
-        write_log(f"[{_now()}] 型号选择: {picked} -> profile={self.args.profile!r}")
-        self.do_measure()
 
     def _number_row(self, parent, title, size, pady=(0, 10)):
         """一行大数字：小标题 + 特大数字 + 单位。返回数字 Label 供更新。"""
@@ -612,64 +540,31 @@ class MeasureWindow:
         self.src.drain_preview()            # 结果图不许被残留预览帧冲掉
         self.result = r
         self.lbl_time.config(text=r.timestamp.strftime("%Y-%m-%d %H:%M:%S"))
-        if r.overall_judged:
-            self._set_status(r.overall, COLOR_OK if r.overall == "OK" else COLOR_NG)
-        else:
-            self._set_status("已测量", COLOR_BUSY)
+        self._set_status("已测量", COLOR_BUSY)
 
-        # 没有本型号的换算系数时只显示像素：带 (px) 后缀 + 弱化颜色，不会被当成毫米读
+        # 没有机位系数时只显示像素：带 (px) 后缀 + 弱化颜色，不会被当成毫米读
         if r.outer_mm is None:
             self.lbl_od.config(text=f"{r.outer_px:.0f}(px)", fg=COLOR_MUTED)
         else:
             self.lbl_od.config(text=f"{r.outer_mm:.3f}", fg=COLOR_TEXT)
-        if not r.center_hole_expected:
-            self.lbl_id.config(text="无此孔", fg=COLOR_MUTED)   # 本型号本来就没有，不是"没测到"
-        elif r.center_hole_px is None:
-            self.lbl_id.config(text="未测到", fg=COLOR_NG)
-        elif r.center_hole_mm is None:
-            self.lbl_id.config(text=f"{r.center_hole_px:.0f}(px)", fg=COLOR_MUTED)
-        else:
-            self.lbl_id.config(text=f"{r.center_hole_mm:.3f}", fg=COLOR_TEXT)
 
-        for i, lbl in enumerate(self.inner_labels):
-            it = r.inner_rings[i] if i < len(r.inner_rings) else None
-            if it is None:
-                lbl.config(text="—", fg=COLOR_MUTED)
-            elif it.get("status") != "OK" or it.get("px") is None:
-                lbl.config(text="未测到", fg=COLOR_NG)
-            elif it.get("mm") is None:
-                lbl.config(text=f"{it['px']:.0f}(px)", fg=COLOR_MUTED)
-            else:
-                lbl.config(text=f"{it['mm']:.3f}", fg=COLOR_TEXT)
+        # 清单条数不固定 -> 每次重建（这里就是主线程；tkinter 只能主线程碰）
+        for w in self.list_frame.winfo_children():
+            w.destroy()
+        for e in r.edges[1:]:                       # #1 已经在大字里了
+            mm = (f"{e['dia_px'] * r.ratio:9.3f} mm" if r.ratio is not None else "      (px)")
+            tag = POLARITY_CN.get(e["pol"], "")
+            tk.Label(self.list_frame,
+                     text=f"#{e['idx']:<3d} {e['dia_px']:8.1f} {mm}  {tag}  点{e['n']}",
+                     font=(self.ui, 12), bg=COLOR_BG, fg=COLOR_TEXT,
+                     anchor="w").pack(anchor="w")
+        if len(r.edges) <= 1:
+            tk.Label(self.list_frame, text="（只找到外缘：没有同心内边）",
+                     font=(self.ui, 11), bg=COLOR_BG, fg=COLOR_MUTED).pack(anchor="w")
 
-        for i, lbl in enumerate(self.bolt_labels):
-            b = r.bolts[i] if i < len(r.bolts) else None
-            if b is None or (b.get("mm") is None and b.get("px") is None):
-                lbl.config(text=f"{CIRCLED[i]}—", fg=COLOR_MUTED)
-            elif b.get("mm") is None:
-                lbl.config(text=f"{CIRCLED[i]}{b['px']:.0f}px", fg=COLOR_MUTED)
-            else:
-                # 位置推定的孔加个 ? —— 它的位置是按等角假设推的，不是实测到的峰
-                mark = "?" if b.get("src") == "synthesized" else ""
-                lbl.config(text=f"{CIRCLED[i]}{b['mm']:.3f}{mark}",
-                           fg=COLOR_NG if b.get("ok") is False else COLOR_TEXT)
-
-        msgs = []
-        hidden = len(r.bolts) - len(self.bolt_labels)
-        if hidden > 0:
-            # 孔位只有 6 个（CIRCLED），多出来的**必须说出来**，不能静默丢掉——
-            # 当年"写死 6 孔、12 孔零件静默只报 6 个"就是这一类坑。
-            msgs.append(f"⚠ 本件检测到 {len(r.bolts)} 个孔，界面只显示前 {len(self.bolt_labels)} 个")
-        if len(r.inner_rings) > len(self.inner_labels):
-            msgs.append(f"⚠ 本件检测到 {len(r.inner_rings)} 个内圈，"
-                        f"界面只显示前 {len(self.inner_labels)} 个")
-        if r.ident_source == IDENT_UNIDENTIFIED:
-            # 认不出型号就不猜（没有读数总比拿错型号的读数安全）：提示操作员手动指定
-            hint = ("⚠ 没能自动识别零件型号：请在上面「型号」里选一个（或选「无档案试测」）"
-                    if self.cmb_profile is not None else
-                    "⚠ 没能自动识别零件型号：请用命令行 --profile <型号名> 指定后重测")
-            msgs.append(hint)
-        msgs += ["⚠ " + w for w in r.warnings]
+        msgs = ["⚠ " + w for w in r.warnings]
+        if r.ratio is None:
+            msgs.append("⚠ 机位没标定过：本次只有像素。用 --ref-mm <外径真值> 标定一次才有毫米。")
         if msgs:
             self._show_message("；\n".join(msgs), "warn")
         else:
@@ -682,14 +577,10 @@ class MeasureWindow:
         self.btn_again.config(state="normal")
         self._sync_pause_button()
         self._measuring = False
-        prof = (f"型号: {r.profile_name}" if r.profile_name else "型号: 未指定（无档案）")
-        prof += f"（{IDENT_LABEL.get(r.ident_source, r.ident_source)}）"
-        if r.unverified:
-            prof += "·未验证"
         coef = (f"换算系数: {r.ratio:.6f} mm/px（{r.ratio_src}）" if r.ratio is not None
                 else f"换算系数: 无（{r.ratio_src}）")
         self.lbl_foot.config(
-            text=f"图像: {r.src_desc}    {prof}    {coef}"
+            text=f"图像: {r.src_desc}    {coef}"
                  f"    帧率: {self.src.fps:.1f} fps\n报告: {r.report_txt}")
 
     def _render_error(self, exc):
@@ -699,9 +590,8 @@ class MeasureWindow:
         self._measuring = False
         # 测失败就别把上一次的读数留在屏幕上误导人
         self.lbl_od.config(text="—", fg=COLOR_MUTED)
-        self.lbl_id.config(text="—", fg=COLOR_MUTED)
-        for i, lbl in enumerate(self.bolt_labels):
-            lbl.config(text=f"{CIRCLED[i]}—", fg=COLOR_MUTED)
+        for w in self.list_frame.winfo_children():
+            w.destroy()
         brief = friendly_error(exc)
         if not self.src.is_alive():
             # 取图线程已退出（相机掉了 / 取图超时），画面不会再更新

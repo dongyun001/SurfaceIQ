@@ -4,8 +4,8 @@ r"""通用量测核心：定圆心 + 列出所有同心边。**不命名、不�
 全都无关，只回答一句话："我在这些半径处看到了边。"
 
 几何原语**一律从 `fit_ellipse_ring` 复用**（`find_outer` / `find_edge_points` /
-`filter_and_fit` / `_inner_ok`），不在这里另写一份——那份实现是这个项目的读数基线，
-复制出来就会变成两套数。阶段 4 把它们搬过来、去掉下划线改成公开名，届时本文件的 import 会跟着改。
+`filter_and_fit` / `edge_ok`），不在这里另写一份——那份实现是这个项目的读数基线，
+复制出来就会变成两套数。
 
 **既定边界（见计划文档 §4）**：圆心沿用 `find_outer`，所以**外缘必须可见**。
 深色件 / 外缘低对比度的件（型号2 那种）不在本模式射程内，`find_outer` 会失败，
@@ -23,19 +23,20 @@ import sys
 import numpy as np
 
 from fit_ellipse_ring import (
-    N_RAY, _inner_ok, filter_and_fit, find_edge_points, find_outer,
+    N_RAY, edge_ok, filter_and_fit, find_edge_points, find_outer,
 )
 
 # ---------------- 扫描参数 ----------------
 # 半宽与步进的关系是这套做法成立的关键：步进必须 **小于** 半宽，带与带之间才重叠，
 # 每条边才至少完整落进某一个带里（带里若挤进两条边，"最陡梯度"只会挑走陡的那条）。
 LIST_F_LO = 0.16          # 向内扫到外圈半径的这个比例（再往里多是台面/噪声）
-LIST_F_HI = 0.94          # 向外扫到的上限：外缘自己由 find_outer 单列，而 _inner_ok
+LIST_F_HI = 0.94          # 向外扫到的上限：外缘自己由 find_outer 单列，而 edge_ok
                           #   本来就要求半径 < 0.95×外圈，扫到这儿足够
 LIST_BAND_HALF = 0.018    # 候选带半宽（×外圈半径）=> 带宽 0.036
 LIST_BAND_STEP = 0.025    # 相邻带的步进（×外圈半径）
 LIST_MIN_GRAD = 1.2       # 亚像素找边的梯度门槛：宁可多列，靠"支撑点数"让人看出哪条虚
 LIST_MERGE_TOL = 0.012    # 同极性、半径差在此比例内视为同一条边（×外圈半径）
+OUTER_LOW_GRAD = 0.8      # 外圈低对比度重试用的梯度门槛（默认是 2.0，见 find_outer）
 
 # 极性 -> 人看的说法（报告与界面都用这句，别在两处各写一遍）
 POLARITY_NAME = {-1: "亮→暗", +1: "暗→亮"}
@@ -60,7 +61,7 @@ def _scan_candidates(sm, outer):
             ell, n = filter_and_fit(pts, ocx, ocy, r0 * r_outer)
             # 同一条边会落进好几个重叠的带，这里不去重（交给 _merge_votes），
             # 因为"几个带都同意"本身就是这条边有多可靠的信号。
-            if ell is not None and _inner_ok(ell, n, outer):
+            if ell is not None and edge_ok(ell, n, outer):
                 out.append((pol, ell, n, (ell[1][0] + ell[1][1]) / 4, r0))
         r0 += LIST_BAND_STEP
     return out, r_outer
@@ -100,9 +101,15 @@ def list_concentric(img, init_c=None, init_r=None):
 
     gray = img if img.ndim == 2 else cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
     found, sm, fail = find_outer(gray, init_c, init_r)
+    low_contrast = False
+    if found is None and fail == "not_found":
+        # 低对比度件：外缘梯度中位可能刚好卡在默认门槛 2.0 上（实测零件2 = 2.00，一半射线过不了）。
+        # 降门槛重试一次，并把这件事**显式标出来**——这类读数不确定度更大，不许冒充正常读数。
+        found, sm, fail = find_outer(gray, init_c, init_r, min_grad=OUTER_LOW_GRAD)
+        low_contrast = found is not None
     if found is None:
         return {"outer": None, "fail": fail, "center": None, "r_outer": None,
-                "edges": []}
+                "edges": [], "low_contrast": False}
 
     outer, n_outer = found
     (ocx, ocy), (oa1, oa2), oang = outer
@@ -126,7 +133,7 @@ def list_concentric(img, init_c=None, init_r=None):
             "src": "scan",
         })
     return {"outer": outer, "fail": None, "center": (ocx, ocy),
-            "r_outer": r_outer, "edges": edges}
+            "r_outer": r_outer, "edges": edges, "low_contrast": low_contrast}
 
 
 def _main(argv):
