@@ -340,6 +340,7 @@ class MeasureWindow:
         left = tk.Frame(body, bg=COLOR_BG)
         left.pack(side="left", anchor="n")
         self.lbl_od = self._number_row(left, "外缘（#1）", 40)
+        self.lbl_holes = self._number_row(left, "孔（成组）", 14)
         tk.Label(left, text="同心边清单（按半径由外向内；不命名，请对照图纸判断）",
                  font=(self.ui, 10), bg=COLOR_BG, fg=COLOR_MUTED).pack(anchor="w",
                                                                       pady=(4, 2))
@@ -561,6 +562,24 @@ class MeasureWindow:
             self.lbl_od.config(text=f"{r.outer_px:.0f}(px)", fg=COLOR_MUTED)
         else:
             self.lbl_od.config(text=f"{r.outer_mm:.3f}", fg=COLOR_TEXT)
+
+        # 孔：一键测完直接显示，不需要二次操作。暗斑孔 / 亮环孔用不同后缀区分。
+        if r.holes:
+            parts = []
+            for h in r.holes:
+                if h["dia_px"] <= 0:
+                    parts.append(f"H{h['idx']} 失败")
+                elif r.ratio is not None:
+                    parts.append(f"H{h['idx']} {h['dia_px'] * r.ratio:.2f}")
+                else:
+                    parts.append(f"H{h['idx']} {h['dia_px']:.0f}px")
+            kind = ("亮环" if any(h.get("boundary") == "bright_ring" for h in r.holes)
+                    else "暗斑")
+            self.lbl_holes.config(
+                text=f"{'  '.join(parts)}\n{len(r.holes)} 孔 · {kind}边界",
+                fg=COLOR_TEXT)
+        else:
+            self.lbl_holes.config(text=r.holes_note or "—", fg=COLOR_MUTED)
 
         # 清单条数不固定 -> 每次重建（这里就是主线程；tkinter 只能主线程碰）
         for w in self.list_frame.winfo_children():

@@ -1,6 +1,6 @@
 r"""零件尺寸测量：**列出检出的一条条同心边**（不命名、不判合格），一份机位系数换毫米。
 
-这是"通用量测模式"的入口（`docs/通用量测模式计划.md`）。它只回答两个问题：
+这是"通用量测模式"的入口（`docs/设计决策记录.md` §11）。它只回答两个问题：
 **我在这些半径处看到了边**、**这些边换算成毫米是多少**。"哪条边是外径/中心孔/内孔"
 和"合不合格"都不归它管——由人对着标注图和图纸判断。所以：
 
@@ -45,6 +45,7 @@ sys.path.insert(0, "src")
 import annotate
 import concentric
 import config
+import fit_ellipse_ring
 from camera_adapter import create_camera
 
 RIG_PATH = Path("models/rig.json")     # 机位档案（mm/px 的唯一真相源）
@@ -94,6 +95,10 @@ class RingResult:
     outer_mm: Optional[float]
     edges: list                     # **要报的**清单（默认只含强边 + 外缘）
     hidden: int = 0                 # 检出但没列的弱/中边条数（默认隐藏，见 --all-edges）
+    holes: list = field(default_factory=list)   # 成组偏心孔（与 edges 并列的另一条分支）
+    holes_note: str = ""                        # 孔的排列结论 / 失败原因
+    outer_cue: str = "intensity"                # 外缘取边路径：intensity / intensity_weak / texture_mid
+    outer_cue_info: dict = field(default_factory=dict)
     tilt: float = 1.0
     touches_border: bool = False
     warnings: list = field(default_factory=list)
@@ -177,6 +182,138 @@ def _outer_fail_message(img: np.ndarray, reason) -> str:
     return locate_fail_hint(img)
 
 
+# ---------------- 成组孔（偏心孔） ----------------
+
+def measure_holes(img: np.ndarray, res: dict, ratio):
+    """成组偏心孔：与同心边并列的另一条分支。
+
+    检测层与排列无关（只找暗色圆斑），排列校验是可插拔策略
+    （`fit_ellipse_ring.validate_equidistant_circle` / `validate_rectangle` / `validate_generic`）。
+
+    返回 `(holes, note, warnings)`。找不到就返回空列表——**不抛异常**：
+    "这件没有成组孔"是正常结果，不是测量失败。
+    """
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    sm = cv2.GaussianBlur(gray, (0, 0), 5)
+
+    (ocx, ocy), (oa1, oa2), _ = res["outer"]
+    r_outer = float(res["r_outer"])
+    # 局部归一化窗口随 R 缩放（旧代码写死 201，对应 R≈1013；换零件/机位才不跑偏）
+    win = max(31, int(round(0.2 * r_outer)) | 1)
+    norm = sm / np.maximum(cv2.blur(sm, (win, win)), 1.0)
+
+    # 内边界取"最内侧的非外缘边"×1.05；只有外缘时（实心盘）退到 0.55R
+    inner = [e for e in res["edges"] if e.get("src") != "outer"]
+    r_inner = (min(e["r_px"] for e in inner) * 1.05 if inner else 0.55 * r_outer)
+    band = fit_ellipse_ring.hole_band_mask(gray.shape, res["outer"], r_inner)
+
+    cands = fit_ellipse_ring.find_dark_blobs(norm, band, r_outer)
+
+    # 先只试暗斑的强排列（等角圆 / 矩形）。**generic 放到亮环之后再兜底**：
+    # 装好紧固件的件上，暗芯+暗影会凑出 3 个假候选，generic 会把它们当孔收下，
+    # 反而挡住更可靠的亮环路径（2026-11-03 实测）。
+    checks = []
+    if cands:
+        checks = [
+            fit_ellipse_ring.validate_equidistant_circle(cands, ocx, ocy),
+            fit_ellipse_ring.validate_rectangle(cands),
+        ]
+    verdict = next((v for v in checks if v and v.get("ok")), None)
+    if verdict is None:
+        # 暗斑不成组 -> 试"亮环"（已装紧固件的孔：螺钉头/沉孔口）
+        rings = fit_ellipse_ring.find_bright_rings(norm, band, ocx, ocy, r_outer)
+        rv = fit_ellipse_ring.validate_rectangle(rings) if len(rings) == 4 else None
+        if rv and rv.get("ok"):
+            holes, warns = [], []
+            for i, j in enumerate(rv["indices"], start=1):
+                ring = rings[j]
+                pts = np.asarray(ring["pts"], float)
+                ell, n = (fit_ellipse_ring.filter_and_fit(
+                    pts, ring["cx"], ring["cy"], ring["r"])
+                    if len(pts) >= 20 else (None, 0))
+                d_c = float(np.hypot(ring["cx"] - ocx, ring["cy"] - ocy))
+                ang = float(np.degrees(np.arctan2(ring["cy"] - ocy,
+                                                  ring["cx"] - ocx)) % 360)
+                h = {"idx": i, "votes": int(ring["votes"]),
+                     "circularity": float(ring["circ"]), "contrast": 0.0,
+                     "boundary": "bright_ring"}
+                if ell is None:
+                    h.update({"cx": float(ring["cx"]), "cy": float(ring["cy"]),
+                              "r_norm": d_c / r_outer, "angle_deg": ang,
+                              "dia_px": 0.0, "a1": 0.0, "a2": 0.0, "ang": 0.0,
+                              "n_points": int(n), "aspect": 0.0, "status": "失败"})
+                else:
+                    (ex, ey), (ea1, ea2), eang = ell
+                    h.update({"cx": float(ex), "cy": float(ey),
+                              "r_norm": float(np.hypot(ex - ocx, ey - ocy) / r_outer),
+                              "angle_deg": float(np.degrees(np.arctan2(
+                                  ey - ocy, ex - ocx)) % 360),
+                              "dia_px": float((ea1 + ea2) / 2),
+                              "a1": float(ea1), "a2": float(ea2), "ang": float(eang),
+                              "n_points": int(n),
+                              "aspect": float(max(ea1, ea2) / max(min(ea1, ea2), 1e-6)),
+                              "status": ("OK" if n >= fit_ellipse_ring.HOLE_LOW_POINTS
+                                         else "低置信度")})
+                holes.append(h)
+            warns.append("孔：走的是亮环边界（螺钉头/沉孔口），不是通孔内壁；含义与暗斑孔不同")
+            n_bad = sum(1 for h in holes if h["status"] != "OK")
+            if n_bad:
+                warns.append(f"孔：{n_bad} 个亮环边界低置信度")
+            return holes, f"{len(holes)} 个（矩形排列，亮环边界；已装紧固件）", warns
+        # 亮环也不成组 -> 暗斑 generic 兜底（≥3 才收，明确标未校验）
+        generic = fit_ellipse_ring.validate_generic(cands)
+        if generic and generic.get("ok"):
+            verdict = generic
+        else:
+            if not cands and not rings:
+                return [], "未发现暗色成组孔或亮环孔", []
+            return [], (f"找到 {len(cands)} 个暗候选、{len(rings)} 个亮环候选，"
+                        "均未成组"), [f"孔：{len(cands)} 暗 + {len(rings)} 亮环，未成组"]
+
+    edge_r = [float(e["r_px"]) for e in res["edges"]]
+    holes, warns = [], []
+    for i, j in enumerate(verdict["indices"], start=1):
+        c = cands[j]
+        d_c = float(np.hypot(c["cx"] - ocx, c["cy"] - ocy))
+        ang = float(np.degrees(np.arctan2(c["cy"] - ocy, c["cx"] - ocx)) % 360)
+        # 只作采样上限；逐射线的边界限制由 fit_hole_boundary 按方向算
+        # （孔常常紧挨环形槽，全局取"最近边"会把所有射线都砍掉）
+        max_r = min(2.6 * c["r"], 0.5 * r_outer)
+        ell, n, contrast = fit_ellipse_ring.fit_hole_boundary(
+            sm, c["cx"], c["cy"], c["r"], max_r,
+            edge_radii=edge_r, part_center=(ocx, ocy))
+        h = {"idx": i, "votes": int(c["votes"]), "circularity": float(c["circ"]),
+             "contrast": float(contrast), "boundary": "dark_blob"}
+        if ell is None:
+            h.update({"cx": float(c["cx"]), "cy": float(c["cy"]), "r_norm": d_c / r_outer,
+                      "angle_deg": ang, "dia_px": 0.0, "a1": 0.0, "a2": 0.0, "ang": 0.0,
+                      "n_points": int(n), "aspect": 0.0, "status": "失败"})
+        else:
+            (ex, ey), (ea1, ea2), eang = ell
+            h.update({"cx": float(ex), "cy": float(ey),
+                      "r_norm": float(np.hypot(ex - ocx, ey - ocy) / r_outer),
+                      "angle_deg": float(np.degrees(np.arctan2(ey - ocy, ex - ocx)) % 360),
+                      "dia_px": float((ea1 + ea2) / 2), "a1": float(ea1), "a2": float(ea2),
+                      "ang": float(eang), "n_points": int(n),
+                      "aspect": float(max(ea1, ea2) / max(min(ea1, ea2), 1e-6)),
+                      "status": ("OK" if (n >= fit_ellipse_ring.HOLE_LOW_POINTS
+                                          and c["votes"] >= 4) else "低置信度")})
+        holes.append(h)
+
+    if verdict["kind"] == "equidistant_circle":
+        note = f"{len(holes)} 个（等角圆排列，角度残差最大 {verdict['ang_dev']:.1f}°）"
+    elif verdict["kind"] == "rectangle":
+        note = f"{len(holes)} 个（矩形排列，对角线中点偏差 {verdict['mid_dev'] * 100:.1f}%）"
+    else:
+        note = f"{len(holes)} 个（未校验排列）"
+    if verdict.get("unchecked"):
+        warns.append("孔：未做排列校验（generic），候选里可能混有非孔暗斑，读数只能参考")
+    n_bad = sum(1 for h in holes if h["status"] != "OK")
+    if n_bad:
+        warns.append(f"孔：{n_bad} 个边界失败/低置信度（点数少或轴比大），读数只能参考")
+    return holes, note, warns
+
+
 # ---------------- 测量 ----------------
 
 def measure(img: np.ndarray, args) -> RingResult:
@@ -222,6 +359,21 @@ def measure(img: np.ndarray, args) -> RingResult:
         _p(f"⚠️  外缘对比度低：默认梯度门槛 2.0 下没定住，已降到 {concentric.OUTER_LOW_GRAD} 重试成功。")
         _p("    这类读数对光照/对焦更敏感，不确定度大于 ±1.4%，别当精密量具用。")
         warnings.append("外缘对比度低（已降低梯度门槛），读数不确定度更大")
+    # ---- 外缘取边路径：报告必须写明走了哪条，别让它看起来和强度边一样 ----
+    cue = res.get("outer_cue", "intensity")
+    cue_info = res.get("outer_cue_info") or {}
+    if cue == "texture_mid":
+        _p(f"外缘取边：纹理中点（灰度差 {cue_info.get('delta', 0):.0f}、"
+           f"纹理比 {cue_info.get('rho', 0):.1f}×）")
+        _p("    强度边不足以定边，改用「纹理边界与强度边的中点」；这是另一套定义，不确定度更大。")
+        warnings.append("外缘改用纹理中点（弱对比件）：定义与强度边不同，不确定度更大")
+        if cue_info.get("gap_ratio", 1.0) < fit_ellipse_ring.EDGE_CUE_MIN_GAP:
+            _p(f"    ⚠️ 纹理边界离强度边只有 {cue_info['gap_ratio'] * 100:.1f}%，"
+               "背景对比可能不足；建议换乳白背景")
+            warnings.append("纹理边界离强度边太近：背景对比不足，建议换乳白背景")
+    elif cue == "intensity_weak":
+        _p(f"⚠️  外缘取边：强度边（灰度差仅 {cue_info.get('delta', 0):.0f}，边界不可靠）")
+        warnings.append("外缘灰度对比不足，边界不可靠；建议换背景或补光")
     if ratio is None:
         _p(f"换算系数: 无 —— {ratio_src}")
         _p("        没有系数就**只报像素、不给毫米**（拿别的机位的系数印毫米数是错的）")
@@ -265,13 +417,46 @@ def measure(img: np.ndarray, args) -> RingResult:
     if len(detected) <= 1:
         _p("（只找到外缘：这件零件没有检出同心内边——实心光滑盘就是这样）")
 
+    # ---- 成组孔（与同心边并列的另一条分支）----
+    holes, holes_note, hole_warns = measure_holes(img, res, ratio)
+    warnings.extend(hole_warns)
+    _p(f"\n孔：{holes_note}")
+    for h in holes:
+        if h["dia_px"] > 0:
+            mm = "" if ratio is None else f'  {h["dia_px"] * ratio:8.3f} mm'
+            mark = "" if h["status"] == "OK" else f'  ⚠️ {h["status"]}'
+            if h.get("boundary") == "bright_ring":
+                support, tag = f'轮廓点 {h["n_points"]}', "  亮环"
+            else:
+                support, tag = f'点 {h["n_points"]}/{fit_ellipse_ring.N_RAY}', ""
+            _p(f'  H{h["idx"]:<3d} {h["dia_px"]:8.1f} px{mm}  '
+               f'角{h["angle_deg"]:6.1f}°  d/R {h["r_norm"]:.3f}  '
+               f'[{support}  票 {h["votes"]}  轴比 {h["aspect"]:.2f}{tag}]{mark}')
+        else:
+            _p(f'  H{h["idx"]:<3d} 边界失败（点 {h["n_points"]}）  '
+               f'角{h["angle_deg"]:6.1f}°  d/R {h["r_norm"]:.3f}')
+    dias = [h["dia_px"] for h in holes if h["dia_px"] > 0]
+    if len(dias) >= 2:
+        med = float(np.median(dias))
+        spread = max(dias) - min(dias)
+        med_mm = "" if ratio is None else f" = {med * ratio:.3f} mm"
+        _p(f'  {len(dias)} 孔直径中位 {med:.1f} px{med_mm}，'
+           f'极差 {spread:.1f}px（{100 * spread / med:.1f}%）')
+    if holes:
+        if any(h.get("boundary") == "bright_ring" for h in holes):
+            _p("  提示：孔径取「亮环外轮廓」（螺钉头/沉孔口），不是通孔内壁；与暗斑孔的读数含义不同")
+        else:
+            _p("  提示：孔径取「梯度最大（steepest）」，与同心边同一套定义；孔和边一样有取边问题")
+
     if ratio is not None:
         _p(f"\n提示: 单像素量化误差 = {ratio:.3f} mm；"
            "读数的不确定度主要来自'外缘是一条有厚度的带'，实测约 ±1.4%")
 
     # ---- 标注图 + 报告落盘 ----
     keep_ids = {e["idx"] for e in edges}
-    dbg = annotate.draw_listing(img, res, ratio, label_filter=lambda e: e["idx"] in keep_ids)
+    dbg = annotate.draw_listing(img, res, ratio,
+                                label_filter=lambda e: e["idx"] in keep_ids,
+                                holes=holes)
     DEBUG_DIR.mkdir(exist_ok=True)
     dbg_path = DEBUG_DIR / "measure_ring_debug.jpg"
     if not cv2.imwrite(str(dbg_path), dbg):     # 路径是 ASCII，但仍判返回值
@@ -285,6 +470,8 @@ def measure(img: np.ndarray, args) -> RingResult:
         src_desc=src_desc, timestamp=timestamp, ratio=ratio, ratio_src=ratio_src,
         outer_px=outer_dia_px, outer_ellipse=outer, outer_mm=od_mm, edges=edges,
         hidden=hidden,
+        holes=holes, holes_note=holes_note,
+        outer_cue=cue, outer_cue_info=cue_info,
         tilt=tilt, touches_border=touches_border, warnings=warnings, lines=lines,
         debug_jpg=dbg_path, report_txt=rep_path, debug_img=dbg,
     )

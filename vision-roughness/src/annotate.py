@@ -1,7 +1,7 @@
 r"""图上标注：把"检出的一堆同心边"画到原图上，每条边带编号与数值，用引线牵出来。
 
 为什么单独一个文件：CLI 与 GUI 都要用它，而且它只做排版、不碰数值。
-设计意图见 `docs/通用量测模式计划.md`：**图上标注是一等公民**——不命名之后，
+设计意图见 `docs/设计决策记录.md` §11：**图上标注是一等公民**——不命名之后，
 "这条边是哪个尺寸"只能靠人对着图认，图就是主要输出。
 
 两条硬约束（都是这个项目踩过的坑，别改回去）：
@@ -18,6 +18,7 @@ COLOR_OUTER = (0, 255, 0)
 COLOR_SRC = "outer"
 COLOR_B2D = (0, 0, 255)      # 亮→暗（下降沿）
 COLOR_D2B = (255, 0, 255)    # 暗→亮（上升沿）
+COLOR_HOLE = (0, 165, 255)   # 成组孔：橙色（BGR），与边的绿/红/品红区分开
 
 FONT = cv2.FONT_HERSHEY_SIMPLEX
 FONT_SCALE = 0.9
@@ -106,12 +107,14 @@ def _place_labels(edges, ratio, w, h):
             for it in items]
 
 
-def draw_listing(img, res, ratio=None, label_filter=None):
+def draw_listing(img, res, ratio=None, label_filter=None, holes=None):
     """在图上画出 `concentric.list_concentric` 的清单，返回标注好的图（新数组）。
 
     ratio 给了就把 mm 也写进标签（mm = px × 系数）。清单为空时返回原图的副本。
     `label_filter` 决定**哪些边打标签**（圆照样全画，弱边是细线）——默认只标要报的那几条，
     免得把不稳定弱边的数字也印上去。
+    `holes` 是 `RingResult.holes`（成组孔的**另一条分支**）：有就画橙色椭圆 + `H1 …` 标签，
+    不参与边的编号。
     """
     out = img.copy()
     if out.ndim == 2:
@@ -141,14 +144,23 @@ def draw_listing(img, res, ratio=None, label_filter=None):
         cv2.circle(out, (int(ax), int(ay)), 5, col, -1)
         cv2.putText(out, text, (int(text_x), int(base_y)), FONT, FONT_SCALE, col,
                     FONT_THICK, cv2.LINE_AA)
+
+    # ---- 成组孔：橙色椭圆 + H1 标签（另一条分支，不参与边的编号）----
+    for h in (holes or []):
+        if h.get("dia_px", 0) <= 0:
+            continue
+        cv2.ellipse(out, ((h["cx"], h["cy"]), (h["a1"], h["a2"]), h["ang"]),
+                    COLOR_HOLE, 4)
+        text = f'H{h["idx"]} {h["dia_px"]:.1f}px'
+        if ratio is not None:
+            text += f' {h["dia_px"] * ratio:.2f}mm'
+        ang = np.deg2rad(h["angle_deg"])
+        tx = float(h["cx"] + np.cos(ang) * 90)
+        ty = float(h["cy"] + np.sin(ang) * 90)
+        cv2.line(out, (int(h["cx"]), int(h["cy"])), (int(tx), int(ty)), COLOR_HOLE, 2)
+        (tw, _), _ = cv2.getTextSize(text, FONT, 0.8, 2)
+        tx = tx - tw if np.cos(ang) < 0 else tx
+        tx = float(np.clip(tx, PAD, out.shape[1] - PAD - tw))
+        ty = float(np.clip(ty, PAD + 12, out.shape[0] - PAD))
+        cv2.putText(out, text, (int(tx), int(ty)), FONT, 0.8, COLOR_HOLE, 2, cv2.LINE_AA)
     return out
-
-
-def save_png(path, img):
-    """存 PNG。**必须走 imencode + tofile**：cv2.imwrite 遇中文路径会静默失败（返回 False）。"""
-    ok, buf = cv2.imencode(".png", img)
-    if not ok:
-        raise RuntimeError(f"PNG 编码失败: {path}")
-    from pathlib import Path
-    Path(path).write_bytes(buf.tobytes())
-    return Path(path)

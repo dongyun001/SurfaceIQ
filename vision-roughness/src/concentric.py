@@ -1,6 +1,6 @@
 r"""通用量测核心：定圆心 + 列出所有同心边。**不命名、不给合格结论。**
 
-这是 `docs/通用量测模式计划.md` 阶段 1/2 的产物。它与型号档案、型号识别、OK/NG 判定
+这是 `docs/设计决策记录.md` §11 所述的"通用量测"模式的产物。它与型号档案、型号识别、OK/NG 判定
 全都无关，只回答一句话："我在这些半径处看到了边。"
 
 几何原语**一律从 `fit_ellipse_ring` 复用**（`find_outer` / `find_edge_points` /
@@ -24,6 +24,7 @@ import numpy as np
 
 from fit_ellipse_ring import (
     N_RAY, edge_ok, filter_and_fit, find_edge_points, find_outer, ray_profile,
+    select_outer_cue,
 )
 
 # ---------------- 扫描参数 ----------------
@@ -109,6 +110,8 @@ def list_concentric(img, init_c=None, init_r=None):
         center / r_outer
         edges       [{idx, dia_px, r_px, a1, a2, ang, cx, cy, n, n_ray, pol, votes, src}]
                     idx 从 1 开始，第 1 条是最外面那条（外缘），src="outer" | "scan"
+        outer_cue   "intensity" | "intensity_weak" | "texture_mid"（外缘取边用了哪条路径）
+        outer_cue_info  {delta, rho, r_int, r_tex, r_mid}；强度路径下 rho/r_tex 可能为空
     """
     import cv2
 
@@ -125,6 +128,8 @@ def list_concentric(img, init_c=None, init_r=None):
                 "edges": [], "low_contrast": False}
 
     outer, n_outer = found
+    # 外缘取边按证据选路径：强制对照件（Δ 大）原样返回，弱对比件才换纹理中点。
+    outer, cue_info = select_outer_cue(sm, outer)
     (ocx, ocy), (oa1, oa2), oang = outer
     r_outer = (oa1 + oa2) / 4
 
@@ -151,7 +156,9 @@ def list_concentric(img, init_c=None, init_r=None):
         e["grad"] = grad
         e["strength"] = classify_strength(step)
     return {"outer": outer, "fail": None, "center": (ocx, ocy),
-            "r_outer": r_outer, "edges": edges, "low_contrast": low_contrast}
+            "r_outer": r_outer, "edges": edges, "low_contrast": low_contrast,
+            "outer_cue": (cue_info or {}).get("cue", "intensity"),
+            "outer_cue_info": cue_info or {}}
 
 
 def _edge_strength(sm, e, n_ray=N_RAY):
@@ -202,7 +209,7 @@ def _main(argv):
     res = list_concentric(img)
     if res["outer"] is None:
         raise SystemExit(f"外缘没定住（{res['fail']}）——通用模式要求外缘可见，"
-                         "低对比度件不在射程内（见 docs/通用量测模式计划.md §4）")
+                         "低对比度件不在射程内（见 docs/设计决策记录.md §11）")
 
     print(f"图: {path}    外圈半径 {res['r_outer']:.1f}px")
     if ratio is None:
