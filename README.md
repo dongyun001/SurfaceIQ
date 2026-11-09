@@ -35,6 +35,9 @@
 现场光弱时可勾选「预览增亮 ×3（仅显示，不影响测量）」看清零件位置——它只改显示亮度，不参与测量。
 出错时把 `0x80000203` 这类错误码翻译成中文提示，不会出现「双击了没反应」。
 
+测**方形 / 矩形件**：双击 **`vision-roughness\测试.bat`**（内部 `--shape rect`），
+窗口给出两组对边距（A 长边 / B 短边）、长宽比和四条边；把照片拖到图标上可测已有图。
+
 > **型号识别已删除（2026-10-23）**：以前不传 `--profile` 会用极坐标指纹自动认型号，
 > 现在**不猜**——没选型号就只给像素、标「未经验证」，毫米数要选了型号才有。
 > 原因见 `docs/设计决策记录.md` §5（已废止）与 `docs/已知缺陷.md` 缺陷 2/5。
@@ -84,18 +87,29 @@ venv\Scripts\python.exe src\measure_ring.py                          # 相机现
 venv\Scripts\python.exe src\measure_ring.py --image <图片路径>        # 测已有照片（图放 data/captures/）
 venv\Scripts\python.exe src\measure_ring.py --image data\captures\capture_20261023_032001.jpg --ref-mm 88.28   # 标定机位
 venv\Scripts\python.exe src\measure_ring.py --image data\captures\<图>.jpg --ref-mm 88.28  # 标定机位
+venv\Scripts\python.exe src\measure_ring.py --mode thickness --side-ref-mm 9.0   # 标定侧视厚度（量块）
+venv\Scripts\python.exe src\measure_ring.py --mode thickness                     # 侧视测厚度（写缓存）
+venv\Scripts\python.exe src\measure_ring.py --image <图> --thickness 6.5         # 外径 + 高度补偿
+venv\Scripts\python.exe src\measure_ring.py --shape rect --image data\captures\fixture_rect_900px.jpg  # 方形件
 ```
 
-> **两个 `data\captures\` 别搞混**：标准验证照片在**仓库根**的 `data\captures\`，
-> 从 `vision-roughness\` 下必须写 `..\data\captures\...`；
-> 而 `vision-roughness\data\captures\` 放的是相机现拍的图（`measure_ring_latest.jpg` 等）。
+> `data\captures\` 就在 `vision-roughness/` 下：回归夹具（`capture_20261023_*.jpg`、
+> 方形合成图 `fixture_rect_900px.jpg`）和相机现拍的图（`measure_ring_latest.jpg`、
+> `thickness_latest.jpg`）都在这里。`.gitignore` 只用 `!` 单列了这三张夹具，其余不入库；
 > 路径写错会报「无法读取图片」。
 
 | 参数 | 说明 |
 |---|---|
 | `--image <路径>` | 测已有照片；不指定则相机现拍 |
-| `--ref-mm <mm>` | 零件**外径卡尺真值**，用于标定**机位**的 mm/px（写回 `models/rig.json`）|
+| `--shape circle\|rect` | `circle`=圆形件（默认，列同心边）；`rect`=方形/矩形件（四条边，按对边距出宽高） |
+| `--mode diameter\|thickness` | `diameter`=同心边/孔（默认）；`thickness`=侧视厚度（同一台相机换 0.3x 远心） |
+| `--ref-mm <mm>` | 卡尺真值，用于标定**机位**的 mm/px（写回 `models/rig.json`）；**圆形=外径，方形=长边** |
 | `--mm-per-px <系数>` | 临时指定换算系数，不写回档案 |
+| `--thickness <mm>` | 本次零件厚度/顶面高度，用于高度补偿；优先于厚度缓存 |
+| `--no-height` | 本次不做高度补偿（对比/排错） |
+| `--side-ref-mm <mm>` | 厚度标定：量块真值高度（写回 `height_model.side`） |
+| `--side-mm-per-px <系数>` | 临时指定侧视系数，不写回档案 |
+| `--side-offset-mm <mm>` | 厚度偏置校正（倒角/取边偏置），默认用档案值 |
 
 > 没有 `--profile` / `--spec-*` / `--tol` 了：**不命名就不判 OK/NG**，标称值请人工对照图纸。
 
@@ -116,6 +130,44 @@ venv\Scripts\python.exe src\measure_ring.py --image data\captures\<图>.jpg --re
 ⚠️ `rig.json` 里的 `uncertainty` 写的是 **±1.4%**：同一机位、两个真值已知的零件反推系数
 实测差 **1.40%**，原因是**外缘是一条有厚度的带**（倒角/圆角），不同零件落在带的不同位置。
 这正是"不建档"的既定代价——档案里"每个型号各存一个系数"本质上是在给这 1.4% 打补丁。
+
+
+## 厚度测量（侧视，0.3x 远心）
+
+**同一台相机换 0.3x 远心镜头**，从侧面拍零件（背光 / 亮背景），量「零件顶面 → 基准台面」
+的像素差，乘侧视 mm/px。它是**另一条测量**，和同心边/孔分开；一台相机换镜头，
+做不到同时取两个视角。
+
+```bash
+# 1) 标定侧视系数（量块 9mm 面；真值必须来自量块/卡尺，不许用标称直径）
+venv\Scripts\python.exe src\measure_ring.py --mode thickness --side-ref-mm 9.0
+# 2) 测厚度（写 debug/thickness_latest.json，30 分钟内有效）
+venv\Scripts\python.exe src\measure_ring.py --mode thickness
+# 3) 换回顶视镜头，外径测量自动读缓存并补偿；也可临时指定
+venv\Scripts\python.exe src\measure_ring.py --image <图> --thickness 6.5
+```
+
+GUI 里是「测厚度」按钮；测完显示厚度、顶面/台面位置、倾斜与 MAD，调试图在
+`debug/thickness_debug.jpg`，文字报告在 `debug/厚度报告_*.txt`。
+
+⚠️ **镜头是拆装的**：换回顶视镜头后，顶视 `mm_per_px` 可能变（焦面/倍率），
+要按 `--ref-mm` 重标一次；侧视 mm/px 只在侧视相机/工装动了之后重标。
+
+**现场要求**：相机水平（纯侧视）、台面线在零件旁边露出、背光（或暗底亮件，改
+`config.THICKNESS.polarity`）。看不到两条水平边时**直接报失败**，不会编一个厚度；
+顶面/台面线倾斜超过 0.5° 会告警。厚度量的是**侧影顶面边**，外缘倒角会让读数略小于
+图纸厚度，可用 `--side-offset-mm` 按卡尺真值校正。0.3x 远心的尺度不随物距变，
+所以轻微离焦不改变比例，但会加噪。
+
+**高度补偿**（`models/rig.json.height_model`，2026-11-03 起 `enabled=true`）：
+
+    s(t) = mm_per_px × (1 + (-0.0017) × (t - 14.4))
+
+- 88mm 标定帧（t=14.4、2025.8px）仍 **88.28**；126mm 件（t=6.5、2855.5px）→ **126.11**
+  （原始 124.44）；回归门②（2846.9px）在 t=6.5 时是 **125.73**（px 不变）。
+- 残余约 ±0.17%（126mm 上约 0.21mm）是**取边带**，不是厚度误差；126mm 的验收按 ±0.2mm。
+- 拿不到厚度（缓存过期 / 没测）时**不补偿**，只报基准系数并告警；`--no-height` 强制不补。
+- 前提是零件**直接坐在同一基准台面上**；有垫块时模型输入要用顶面高度，不是零件厚度。
 
 
 ## 检测管线
@@ -197,6 +249,34 @@ venv\Scripts\python.exe src\measure_ring.py --image data\captures\<图>.jpg --re
 
 ---
 
+## 方形 / 矩形件（2026-11-04 起）
+
+双击 **`测试.bat`**（或命令行 `--shape rect`）。与圆件**并列**的一条路径，不改圆件的任何读数。
+
+- **粗定位**：Otsu/分位阈值 → 最大**矩形**轮廓 → `minAreaRect`；
+  **矩形度**（轮廓面积 / 外接矩形面积）低于 0.85 直接判「不是矩形」——
+  圆形件是 0.785，所以拿圆件跑方形模式会明确报错，不会量出一个"圆"。
+- **精定位**：四条边各自沿法向打剖面 → 亚像素梯度峰 → 3×MAD 鲁棒直线拟合；
+  两端各排除 12% 避开圆角。**不用椭圆拟合**：`cv2.fitEllipse` 会把正方形拟合成正圆
+  （实测 600px 方图报 640.8px，+6.8%，轴比 1.000，静默错读）。
+- **输出**：两组**对边距** A（长边）/ B（短边）、四条边长（直边延长到虚拟角点）、
+  两条对角线、平行/垂直偏差、长宽比。A 固定是较长的那组。
+  **两条长边的间距是短边尺寸，两条短边的间距才是长边尺寸**——方向别搞反。
+- **毫米**：和圆件共用 `models/rig.json` 的同一个机位系数；高度补偿同样生效
+  （方形模式的 `--ref-mm` 指**长边真值**）。
+- 标注图：绿=四条拟合边，青=对边距 A/B，黄=角点/中心。
+
+**实测（交通卡，ID-1 85.60×53.98mm，厚 0.76mm）**：对边距 A/B
+**1917.33 / 1212.43px**；带 `--thickness 0.76` 读 **85.492 / 54.061mm**
+（对标准 −0.13% / +0.15%）；同一张卡连拍 4 帧对边距极差 **0.026% / 0.018%**。
+不带厚度读 83.55 / 52.83mm（低 2.2%，因为卡片比 14.4mm 的标定件薄——这是高度效应，
+不是算法错）。
+
+**限制**：方形模式只量**外轮廓的四条边**，不找孔；圆角通过"两端排除 12%"处理，
+圆角半径特别大时要复核；金属件的边同样是"有厚度的带"（倒角），跨零件比较仍有 ±1.4% 天花板。
+
+---
+
 ## 已知限制（重要，别误读读数）
 
 > 完整清单（含证据、影响、修复方向、**停手与重新开工的条件**）在 **`docs/已知缺陷.md`**。
@@ -209,6 +289,10 @@ venv\Scripts\python.exe src\measure_ring.py --image data\captures\<图>.jpg --re
   k=0.170%/mm；把 126mm 件垫高 9mm 后从 124.4 回到 **126.341**（真值 126.3），
   取边带本身只剩约 ±0.2~0.3%。同一个零件的重复性则好得多（实测外缘连拍 5 帧极差 **0.13%**）。
   → **两个不同的件比外径前，先把顶面垫到同一高度；否则先按厚度估算 0.170%/mm 的偏差。**
+  2026-11-03 起可用**侧视厚度**自动补偿（`--mode thickness`），按当前模型 126mm@6.5
+  读 **126.11**（原始 124.44），残余 ±0.2mm 记在取边带账上；详见「厚度测量」一节。
+- **厚度补偿不是万能的**：它只改毫米换算、不改像素；补偿后的跨零件差仍有约 ±0.17%
+  （126mm 上约 0.21mm），且前提是零件直接坐在同一基准台面上。别把补偿后的读数当"5 丝量具"。
 - **达不到 5 丝（±0.05mm）**：单像素 ≈0.044mm。要提精度得换背光/远心镜头 + 统一"外缘取法"，
   不是调参能救的。
 - **低对比度件（深色件 + 暗背景）**：外缘要靠降门槛才能定住，内部还会出现一二十条
@@ -222,6 +306,11 @@ venv\Scripts\python.exe src\measure_ring.py --image data\captures\<图>.jpg --re
   「现场偏暗」告警——只要外圈稳定，这个告警可以忽略；同时报「削顶」就要补光。
 - **同一个零件在台面上转个角度，检出的外径会变**（实测转 47° 时 +2.5%），原因同上：
   外缘是**一条有厚度的带**。
+- **方形件量的是"对边距"，不是四条边的像素长度**：A 是两条**短边**之间的距离
+  （长边方向总尺寸），B 是两条**长边**之间的距离。四条边长（虚拟角点）只作为一致性证据，
+  别拿它和 A/B 混用；A/B 互换会静默出错（回归夹具专门钉这一条）。
+- **方形件的圆角与贴边**：精定位排除每条边两端 12%，圆角特别大的件要复核；
+  被画幅切边的件必须报 `out_of_frame`，不会给出一个"看起来正常"的读数。
 
 
 ## 下一步：冲 5 丝精度
@@ -248,6 +337,7 @@ SurfaceIQ/
 │   ├── src/
 │   │   ├── gui_ring.py          测量窗口（大字读数 + 实时取景画面 + 中文报错翻译）
 │   │   ├── measure_ring.py      测量主逻辑（CLI 与 GUI 共用同一份结果）
+│   │   ├── thickness.py         侧视厚度（逐列找边 + 两电平聚类 + 厚度缓存）
 │   │   ├── fit_ellipse_ring.py  检测管线（射线亚像素边缘 + 椭圆鲁棒拟合）
 │   │   ├── camera_adapter.py    相机抽象层（webcam / file / hikvision）
 │   │   ├── config.py            相机配置 —— 换相机唯一改动点

@@ -119,6 +119,40 @@ venv\Scripts\python.exe src\measure_ring.py --image data\captures\capture_202610
 **不得触发 `texture_mid`**（触发就意味着弱对比规则误伤，外缘 px 会变）。用例② 会多打印一行
 「外缘取边：强度边（灰度差仅 45，边界不可靠）」——这是刻意的告警，不是回归失败。
 
+**厚度 / 高度补偿（2026-11-03 起）**：
+
+- 厚度是**另一条测量**（同一台相机换 0.3x 远心侧视），不在这两条回归门里。回归门只要求
+  **px 逐字符不变**，以及**没有厚度时 mm 也不变**——跑门前确认 `debug/thickness_latest.json`
+  不存在（或已过期），否则加 `--no-height`；别让上一件的厚度混进回归。
+- 模型算术必须能复现（`height_model.enabled=true`，参数见设计决策记录 §16）：
+  88mm 标定帧 `capture_20261102_101702.jpg` + `--thickness 14.4` → **88.280**；
+  `--thickness 14.4` 时回归门 ① 仍是 `2022.9px / 88.155mm`，② 是 `2846.9px / 124.062mm`；
+  `--thickness 6.5` 时 ② 是 `2846.9px / 125.729mm`。126mm@6.5 → **126.11**（±0.2mm，
+  仓库没有该帧，按设计决策记录 §16 的 px 解析验证）。
+- 厚度几何用合成侧影自检：1600×1200、顶面 300 / 台面 900、σ=3 模糊 → `px=600.0、mm=6.000`
+  （配 `--side-mm-per-px 0.01`）；只有台面、或零件占满整幅看不到台面线，必须**报失败**；
+  顶面倾斜 0.68° 必须告警。真实侧视图到位后按 `--side-ref-mm` 量块值重标，并补一张夹具图。
+- `--ref-mm` 与 `--thickness` 同时给时，系数按基准高度归一化再存盘（标定帧仍读真值）；
+  不要手算、不要手改。
+
+**方形 / 矩形件（2026-11-04 起）**：
+
+- 入口 `--shape rect`（GUI 用 `测试.bat`，内部就是 `--shape rect`）；**不改圆件两条回归门**。
+- 夹具 `data/captures/fixture_rect_900px.jpg`（合成 1600×1200、正方形边长 900px、转 4.3°、
+  σ=2 模糊；**合成图没有真实零件，报告里的 mm 不作为真值，只钉几何 px**）：
+  ```bash
+  venv\Scripts\python.exe src\measure_ring.py --shape rect --image data\captures\fixture_rect_900px.jpg
+  ```
+- **期望 px（逐字符不变）**：`对边距 A（长边）=900.50px`、`B（短边）=900.47px`；
+  四边长 `S1=900.49 / S2=900.49 / S3=900.48 / S4=900.50`；对角差 `0.03px（0.00%）`；
+  平行偏差 `0.001°/0.001°`；垂直偏差 `≤0.002°`；`A/B=1.0000`。
+- **校验要点**：**A/B 不得互换**（A 必须是较长的那组）；圆形件用 `--shape rect` 必须报
+  「找到的最大轮廓不是矩形」，不得量出一个圆；方形件被画幅切边必须报 `out_of_frame`。
+- **卡片实拍（非回归门，人工复核）**：`capture_single_20261104_133210.jpg`（交通卡，
+  ID-1 85.60×53.98mm、厚 0.76mm）→ 对边距 A/B `1917.33/1212.43px`；
+  带 `--thickness 0.76` 得 `85.492/54.061mm`（对 ISO 标准 −0.13%/+0.15%）；
+  不带厚度是 `83.55/52.83mm`（低 2.2%——卡片比 14.4mm 标定件薄，**这是高度效应，不是算法错**）。
+
 **换夹具 / 换机位就重新定版**：先用 `--ref-mm <真值>` 标定（让工具自己算系数，**别手算** —
 手算容易用四舍五入后的 px 而不是内部值），再跑一遍把新的 px 抄进上表。
 
@@ -131,16 +165,18 @@ venv\Scripts\python.exe src\measure_ring.py --image data\captures\capture_202610
 - **不许为了让读数对上标称值去改 `mm_per_px`**（`models/rig.json`）。系数只能由"卡尺真值 ÷
   实测 px"标定出来；**改它去凑读数就是伪造数据**。要改真值，得用户给新的卡尺数据。
 - **`models/mm_per_pixel.json`（旧的全局缓存）已删除，别复活**：它是同一个数的第二份真相源，
-  而且属于"上次标定的某个型号"。现在系数只存在型号档案里；查不到就**只报像素、不给毫米**。
+  而且属于"上次标定的某个型号"。现在系数只存在**机位档案** `models/rig.json` 里；
+  查不到就**只报像素、不给毫米**。
 - **不入库**（`.gitignore`）：`debug/`、`vision-roughness/data/captures/*`、`venv/`、`.zcode/`、
   `**/temp/*`（仅保留 `hik_debug.py`）、`**/models/*.pth`。运行时产物别 `git add`。
-- **入库的参考数据**：`models/rig.json`（机位系数）+ §3 的两张回归夹具图
-  （`.gitignore` 里用 `!` 单列）。型号档案 `part_profiles.json` 与 `models/fingerprints/*`
-  已于 2026-10-23 删除，**别再生成**。
-- **`data/captures/` 现在没有任何例外**（旧回归夹具 2026-10-23 已删，等重拍）。
+- **入库的参考数据**：`models/rig.json`（机位系数）+ §3 的三张回归夹具图
+  （两张圆件 + 一张方形合成图，`.gitignore` 里用 `!` 单列）。型号档案
+  `part_profiles.json` 与 `models/fingerprints/*` 已于 2026-10-23 删除，**别再生成**。
+- **`data/captures/` 只有 §3 显式 `!` 出来的夹具，其余一律不入库**。
   以后再加夹具图照此办理：**在 `.gitignore` 里显式 `!` 出来，不要用 `git add -f`**（后者会留下
   "已跟踪但仍被忽略"的状态，后人 grep 时看不出是故意的）。
-- **`测量.bat` 内容必须 ASCII + CRLF**（内部走 `pythonw` + `gui_ring.py`），存成 UTF-8 或 LF 会让 cmd 报错。
+- **`测量.bat` / `测试.bat` 内容必须 ASCII + CRLF**（内部走 `pythonw` + `gui_ring.py`），
+  存成 UTF-8 或 LF 会让 cmd 报错。
 - 不要重新引入 `7375601` 删掉的粗糙度分类线 / 棋盘格标定路线；**不要新增第三方依赖**（tkinter 是标准库）。
 
 ## 5. 改了会静默出错的坑
@@ -160,7 +196,18 @@ venv\Scripts\python.exe src\measure_ring.py --image data\captures\capture_202610
 - **同一机位、不同零件厚度也会偏**：顶面每高 1mm，真实 mm/px 小 **0.170%**
   （2026-11-03 实测：126mm 件厚 6.5mm 读 124.4，垫高 9mm 后读 **126.341**，真值 126.3）。
   两件厚度差 7.9mm 就解释了那 1.4% 的跨零件差。**最稳的是把顶面垫到同一高度**；
-  软件高度模型在 `rig.json.height_model`，默认 `enabled=false`。
+  软件高度模型在 `rig.json.height_model`，2026-11-03 起 `enabled=true`，但**只有拿到厚度
+  才生效**（`--thickness` 或厚度缓存）；拿不到就只报基准系数并告警。
+- **顶视 `mm_per_px` 与侧视 `height_model.side.mm_per_px` 是两个数**：一个顶视、一个
+  0.3x 远心侧视（约 0.0115mm/px）。混用会让毫米读数静默偏一大截；侧视常数只在侧视
+  相机/工装动了之后重标。
+- **厚度缓存有 30 分钟有效期**（`debug/thickness_latest.json`）：换零件忘了重测厚度，
+  超过有效期就拒绝补偿。**不要为了"总是补上"把有效期调得很大**——那等于把上一件的
+  厚度套到下一件。
+- **侧视边位置取梯度峰值，不取"首次越过阈值"**：离焦时两条边的首次越阈外移量不同，
+  厚度会带系统偏差（合成图实测 6px）。
+- **厚度是"顶面高度"的代理**：零件下面垫了东西时，模型输入要用顶面高度而不是零件厚度；
+  报告会打印这个前提，别把读数当纯厚度真值。
 - **孔径/内圈的偏差是无量纲比值，改系数救不了**：若检出的是"外圈半径的某个比例"变了，
   调 `mm_per_px` 只会等比缩放，改不了比例。遇到"比例不对"要先怀疑**锁错了哪条边**，
   不是标定。详见 `docs/已知缺陷.md`。
@@ -206,6 +253,19 @@ venv\Scripts\python.exe src\measure_ring.py --image data\captures\capture_202610
   outer_cue, outer_cue_info}`。**外缘可能来自强度边或纹理中点**，`outer_cue` 说明是哪条；
   报告必须把这个差异写出来，不能让它看起来和强度边一样。
   **它不命名、不判合格**——这是刻意的产品定位（见 `docs/设计决策记录.md` §11）。
+- **方形 / 矩形件参考系**：与圆件**并列**的一条路径，走 `--shape rect`，**不碰**
+  `find_outer` / `list_concentric`（两条圆件回归门的 px 必须逐位不变）。
+  - 几何：`fit_ellipse_ring.find_rect`（Otsu/分位阈值 → 最大**矩形**轮廓 → `minAreaRect`；
+    矩形度 = 轮廓面积/外接矩形面积，圆 0.785、矩形 0.99，**低于 0.85 直接报 not_rect**，
+    挡住圆形件误用；贴边轮廓跳过 → `out_of_frame`）、`refine_rect`（四条边各自法向剖面 +
+    亚像素梯度峰 + 3×MAD 鲁棒直线拟合）、`_line_pair`（对边距/平行偏差）。
+  - **不要用椭圆拟合方形**：`cv2.fitEllipse` 会把正方形拟合成正圆（实测 600px → 640.8px，
+    +6.8%，轴比 1.000、`_outer_ok` 全过——静默错读）。
+  - 业务：`concentric.list_rect` → `measure_ring.measure_rect` → `RectResult`；
+    CLI 报告、`annotate.draw_rect`（绿=拟合边、青=对边距 A/B）。
+  - **对边距的方向别搞反**：两条**长边**的间距是短边尺寸，两条**短边**的间距才是长边尺寸；
+    A 固定是较长的那组。改这里必须跑 §3 的方形夹具（A/B 互换会静默出错）。
+  - `--ref-mm` 在方形模式里指**长边真值**（对边距 A），不是短边、不是对角线。
 - **成组孔（偏心孔）**：与同心边**并列的另一条分支**，共享外圈参考系，不混进 `edges[]`。
   - 几何：`fit_ellipse_ring.find_dark_blobs`（5 档阈值找暗斑 + 跨阈值合并，`RETR_LIST`）、
     `fit_hole_boundary`（72 射线取**梯度最大** + 鲁棒拟合，逐射线用 `_ray_edge_limit` 防止
@@ -228,8 +288,16 @@ venv\Scripts\python.exe src\measure_ring.py --image data\captures\capture_202610
   **不确定度 ±1.4%**：同机位两个零件反推系数实测差 1.40%，原因是外缘是一条有厚度的带。
 - **外圈定位失败时要说清原因**：`measure_ring.locate_fail_hint` 区分「画面太暗」/「画面过曝」/
   「其他」，别退回成一句笼统的「检查对焦、光照、零件是否在画面中心」。
+- **侧视厚度**：`src/thickness.py`（逐列找边 + 两电平聚类 + 缓存）；入口是
+  `measure_ring --mode thickness`（CLI）与 GUI 的「测厚度」按钮。侧视常数在
+  `rig.json.height_model.side`，**与顶视 `mm_per_px` 分名字空间**；厚度缓存
+  `debug/thickness_latest.json` 30 分钟有效。外径测量在 `resolve_thickness` 读厚度、
+  `resolve_ratio` 应用 `height_model`（只改毫米，不动 px）。**一台相机换镜头，不能同时
+  取两个视角**；没厚度时不补偿并告警。
 - **结果唯一来源**：`measure_ring.measure()` 产出 `RingResult`（含 `edges` 清单），
-  CLI 打印它、GUI 显示它——**不要在 `gui_ring.py` 里自己再算一遍尺寸**。
+  `measure_ring.measure_rect()` 产出 `RectResult`，`run_thickness_on_frame` 产出
+  `ThicknessResult`；CLI 打印它、GUI 显示它——
+  **不要在 `gui_ring.py` 里自己再算一遍尺寸/厚度**。
 - **型号识别与型号档案都已删除（2026-10-23）**：`polar_fingerprint` / `match_fingerprint` /
   `identify_by_bolts` / `FP_*` / `--save-fingerprint` / `models/fingerprints/*` /
   `part_profiles.json` / `--profile` 全都不在了。**现在根本没有"选型号"这一步**：
@@ -238,8 +306,9 @@ venv\Scripts\python.exe src\measure_ring.py --image data\captures\capture_202610
 - **显示层**：`src/gui_ring.py` 只做显示/交互，不改数值。它负责**实时取景**，所以有一条硬约束：
   取帧与测量**只在同一个后台线程**（`LiveSource`）里做，**绝不能让两个线程同时 `capture()`**
   （相机是独占资源）；tkinter 只能在主线程碰，后台线程只往队列塞「编码好的 PNG 字节」和事件。
-  结果图的**缩放/平移/复位**是主线程里从 `RingResult.debug_img`（全分辨率）裁切重画的；
-  "测完冻结"（`_frozen`）必须保持——否则实时预览会把结果图冲掉，缩放也就白做了。
+  结果图的**缩放/平移/复位**是主线程里从 `RingResult` / `RectResult` 的 `debug_img`
+  （全分辨率）裁切重画的；"测完冻结"（`_frozen`）必须保持——否则实时预览会把结果图冲掉，
+  缩放也就白做了。
 - **调参前必须先看数据**，按此顺序跑诊断脚本（cwd 同上，传图片路径）：
   `explore_ring.py` → `ray_ring.py` → `concentric.py`（列全部边+强度）。
   **不要凭直觉改阈值。**
