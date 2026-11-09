@@ -23,8 +23,8 @@ import sys
 import numpy as np
 
 from fit_ellipse_ring import (
-    N_RAY, edge_ok, filter_and_fit, find_edge_points, find_outer, ray_profile,
-    select_outer_cue,
+    N_RAY, edge_ok, filter_and_fit, find_edge_points, find_outer, find_rect,
+    ray_profile, refine_rect, select_outer_cue,
 )
 
 # ---------------- 扫描参数 ----------------
@@ -192,6 +192,35 @@ def classify_strength(step):
     if step >= WEAK_STEP:
         return 1
     return 0
+
+
+def list_rect(img):
+    """方形件参考系：粗定位 + 四条边亚像素 + 鲁棒直线拟合。
+
+    与 `list_concentric` 是**并列分支**：共享机位系数，但采样方式、输出字段都独立，
+    也**不碰**圆件的 `find_outer` / `list_concentric`（两条回归门的 px 必须逐位不变）。
+
+    返回 `fit_ellipse_ring.refine_rect` 的 dict，另补 `thresh` / `rectness` /
+    `part_polarity`。`ok=False` 时 `fail` 说明原因：
+        not_found / not_rect / too_small / out_of_frame / bad_sides
+
+    **不命名、不判合格**：只报两组对边距、四条边长、对角线、平行/垂直偏差。
+    """
+    import cv2
+
+    gray = img if img.ndim == 2 else cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    rect, info, fail = find_rect(gray)
+    if rect is None:
+        return {"ok": False, "fail": fail, "center": None, "sides": [],
+                "warnings": [], "thresh": (info or {}).get("thresh"),
+                "rectness": (info or {}).get("rectness")}
+    res = refine_rect(gray, rect)
+    res["thresh"] = info["thresh"]
+    res["rectness"] = info["rectness"]
+    res["part_polarity"] = info["polarity"]
+    if not res.get("ok"):
+        res["fail"] = res.get("fail") or "bad_sides"
+    return res
 
 
 def _main(argv):

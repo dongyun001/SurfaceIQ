@@ -730,6 +730,356 @@ def select_outer_cue(sm, outer):
     return ((cx, cy), (a1 * k, a2 * k), ang), info
 
 
+# ---------------- 矩形（方形件）参考系 ----------------
+# 2026-11-04 用交通卡实测标定。四条边各自做「法向剖面 + 亚像素梯度峰 + 鲁棒直线拟合」，
+# 用**对边间距**出宽/高。**不要用椭圆拟合**：正方形会被 cv2.fitEllipse 拟合成正圆
+# （实测 600px 合成方图报 640.8px，+6.8%，轴比 1.000、`_outer_ok` 全部通过——静默错读）。
+# 本段只被 `concentric.list_rect` 调用，**不碰** find_outer / list_concentric 的圆件路径。
+RECT_MIN_GRAD = 5.0           # 法向剖面梯度门槛（灰阶/px；卡片实测 12~23）
+RECT_SIDE_EXCLUDE = 0.12      # 每条边两端各排除的比例（避开圆角）
+RECT_PROFILE_IN = 20.0        # 法向剖面向内取多少 px
+RECT_PROFILE_OUT = 10.0       # 向外取多少 px
+RECT_PROFILE_STEP = 0.5       # 剖面采样步长（px）
+RECT_SAMPLE_STEP = 2.0        # 沿边采样间距（px）
+RECT_MIN_POINTS = 20          # 一条边至少要有这么多亚像素点
+RECT_OUTLIER_PX = 0.35        # 直线拟合离群下限（px）
+RECT_OUTLIER_MAD = 3.0        # 3×MAD 迭代剔离群
+RECT_MIN_INLIER_FRAC = 0.55   # 内点比例下限，低于此值视为该边拟合失败
+RECT_RECTANGULARITY = 0.85    # 轮廓面积 / minAreaRect 面积；圆=0.785，方≈0.99
+RECT_MIN_SIZE_FRAC = 0.08     # 短边至少占画幅短边的比例
+RECT_WARN_PARALLEL_DEG = 0.5  # 对边不平行超过此值 -> 告警（透视/倾斜）
+RECT_WARN_PERP_DEG = 0.5      # 相邻边不垂直超过此值 -> 告警
+RECT_WARN_DIAG_PCT = 0.5      # 对角线相对差超过此值(%) -> 告警（透视）
+RECT_FAIL_PARALLEL_DEG = 2.0  # 超过此值矩形假设不成立 -> 失败
+RECT_FAIL_PERP_DEG = 2.0
+
+
+def _bilinear(gray, x, y):
+    """双线性采样；越界返回 nan（剖面越界时整条丢弃，不拿夹紧值充数）。"""
+    h, w = gray.shape[:2]
+    if x < 0 or y < 0 or x >= w - 1 or y >= h - 1:
+        return np.nan
+    x0, y0 = int(np.floor(x)), int(np.floor(y))
+    fx, fy = x - x0, y - y0
+    return (gray[y0, x0] * (1 - fx) * (1 - fy) + gray[y0, x0 + 1] * fx * (1 - fy)
+            + gray[y0 + 1, x0] * (1 - fx) * fy + gray[y0 + 1, x0 + 1] * fx * fy)
+
+
+def _rect_corners(rect):
+    """minAreaRect -> 按角度排好序的 4 个角点（相邻点就是相邻边）。"""
+    (cx, cy), _, _ = rect
+    box = cv2.boxPoints(rect).astype(float)
+    order = np.argsort(np.arctan2(box[:, 1] - cy, box[:, 0] - cx))
+    return box[order]
+
+
+def _rect_part_polarity(gray, corners, center):
+    """零件比背景亮还是暗：亮件向外是下降沿(-1)，暗件向外是上升沿(+1)。"""
+    diffs = []
+    for i in range(4):
+        a, b = corners[i], corners[(i + 1) % 4]
+        u = (b - a) / max(1e-9, float(np.linalg.norm(b - a)))
+        n = np.array([-u[1], u[0]])
+        mid = (a + b) / 2.0
+        if np.dot(n, mid - center) < 0:
+            n = -n
+        vin = _bilinear(gray, *(mid - n * 10.0))
+        vout = _bilinear(gray, *(mid + n * 10.0))
+        if not (np.isnan(vin) or np.isnan(vout)):
+            diffs.append(vin - vout)
+    if not diffs:
+        return -1
+    return -1 if np.median(diffs) > 0 else +1
+
+
+def find_rect(gray, thresh=None):
+    """粗定位方形/矩形件：Otsu（或给定阈值）→ 最大矩形轮廓 → minAreaRect。
+
+    返回 `(rect | None, info | None, fail)`；fail：None / "not_found" / "not_rect" /
+    "too_small" / "out_of_frame"。
+
+    **矩形度 = 轮廓面积 / minAreaRect 面积**是挡"圆形件误用方形模式"的关键判据：
+    圆是 π/4≈0.785，圆角矩形≈0.99。只靠面积挑会把大圆当方件。
+    **贴边的轮廓一律跳过**：反相阈值下背景本身就是一个贴满画幅的"矩形"，
+    不排除它会以面积取胜；真被画幅切掉的零件也据此报 out_of_frame。
+    """
+    h, w = gray.shape[:2]
+    sm = cv2.GaussianBlur(gray, (0, 0), 2)
+    if thresh is None:
+        thresh = float(cv2.threshold(sm, 0, 255,
+                                     cv2.THRESH_BINARY + cv2.THRESH_OTSU)[0])
+    ladder = [float(thresh)]
+    # Otsu 一般够；低对比度/偏暗现场再试两个分位阈值（找不到有效矩形才付这个开销）
+    for q in (85.0, 92.0):
+        ladder.append(float(np.percentile(sm, q)))
+
+    cands, best_any, saw_border, saw_small = [], None, False, False
+    for thr in ladder:
+        for pol, tmode in ((-1, cv2.THRESH_BINARY), (+1, cv2.THRESH_BINARY_INV)):
+            _, bw = cv2.threshold(sm, thr, 255, tmode)
+            cnts, _ = cv2.findContours(bw, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
+            for c in cnts:
+                area = float(cv2.contourArea(c))
+                if area < 0.005 * h * w:
+                    continue
+                x, y, cw, ch = cv2.boundingRect(c)
+                if x <= 1 or y <= 1 or x + cw >= w - 1 or y + ch >= h - 1:
+                    saw_border = True
+                    continue
+                (cx, cy), (rw, rh), ang = cv2.minAreaRect(c)
+                if rw <= 0 or rh <= 0:
+                    continue
+                rectness = area / (rw * rh)
+                info = {"rect": ((float(cx), float(cy)), (float(rw), float(rh)),
+                                 float(ang)),
+                        "area": area, "rectness": rectness, "thresh": thr,
+                        "polarity": pol}
+                if best_any is None or area > best_any["area"]:
+                    best_any = info
+                if rectness < RECT_RECTANGULARITY:
+                    continue
+                if min(rw, rh) < RECT_MIN_SIZE_FRAC * min(h, w):
+                    saw_small = True
+                    continue
+                cands.append(info)
+        if cands:
+            break                       # 这档阈值已找到，不再往下试
+
+    if not cands:
+        if saw_small:
+            return None, best_any, "too_small"
+        if best_any is not None and best_any["rectness"] >= 0.5:
+            return None, best_any, "not_rect"
+        return None, None, ("out_of_frame" if saw_border else "not_found")
+    best = max(cands, key=lambda d: d["area"] * d["rectness"])
+    return best["rect"], best, None
+
+
+def _refine_rect_side(gray, a, b, center, polarity):
+    """一条边的亚像素点集 + 鲁棒直线拟合（局部坐标 h = k·s + h0）。
+
+    法向剖面从**外向内**找第一个满足极性的梯度极值：最外侧的跃变才是零件边界，
+    卡片内侧的印刷图案即使更强也不会被选中。
+    """
+    a = np.asarray(a, float)
+    b = np.asarray(b, float)
+    L = float(np.linalg.norm(b - a))
+    base = {"n": 0, "n_inlier": 0, "resid_px": float("nan"),
+            "grad_med": 0.0, "step": 0.0, "p0": None, "p1": None,
+            "line": None, "ok": False, "angle_deg": float("nan")}
+    if L <= 0:
+        return base
+    u = (b - a) / L
+    n = np.array([-u[1], u[0]])
+    mid = (a + b) / 2.0
+    if np.dot(n, mid - center) < 0:
+        n = -n
+    ds = np.arange(-RECT_PROFILE_IN, RECT_PROFILE_OUT + 1e-9, RECT_PROFILE_STEP)
+    pts, grads, steps = [], [], []
+    for t in np.arange(RECT_SIDE_EXCLUDE, 1.0 - RECT_SIDE_EXCLUDE + 1e-9,
+                       RECT_SAMPLE_STEP / L):
+        pt = a + u * (L * t)
+        prof = np.array([_bilinear(gray, *(pt + n * d)) for d in ds])
+        if np.isnan(prof).any():
+            continue
+        gr = np.gradient(prof)
+        j = None
+        for jj in range(len(gr) - 2, 1, -1):
+            if polarity < 0:
+                if (gr[jj] < 0 and gr[jj] <= gr[jj - 1] and gr[jj] <= gr[jj + 1]
+                        and -gr[jj] >= RECT_MIN_GRAD):
+                    j = jj
+                    break
+            elif (gr[jj] > 0 and gr[jj] >= gr[jj - 1] and gr[jj] >= gr[jj + 1]
+                  and gr[jj] >= RECT_MIN_GRAD):
+                j = jj
+                break
+        if j is None:
+            continue
+        ga, gb, gc = gr[j - 1], gr[j], gr[j + 1]
+        den = ga - 2 * gb + gc
+        delta = 0.5 * (ga - gc) / den if den != 0 else 0.0
+        pts.append(pt + n * (ds[j] + delta * RECT_PROFILE_STEP))
+        grads.append(abs(float(gr[j])))
+        inside = np.median(prof[ds <= -6.0]) if np.any(ds <= -6.0) else np.nan
+        outside = np.median(prof[ds >= 6.0]) if np.any(ds >= 6.0) else np.nan
+        if not (np.isnan(inside) or np.isnan(outside)):
+            steps.append(abs(float(inside - outside)))
+
+    base["n"] = len(pts)
+    base["grad_med"] = float(np.median(grads)) if grads else 0.0
+    base["step"] = float(np.median(steps)) if steps else 0.0
+    if len(pts) < RECT_MIN_POINTS:
+        return base
+
+    P = np.array(pts)
+    s = (P - mid) @ u
+    hh = (P - mid) @ n
+    keep = np.ones(len(P), bool)
+    k = h0 = 0.0
+    for _ in range(4):
+        if int(keep.sum()) < 2:
+            return base
+        k, h0 = np.polyfit(s[keep], hh[keep], 1)
+        r = hh - (k * s + h0)
+        med = float(np.median(r[keep]))
+        mad = 1.4826 * float(np.median(np.abs(r[keep] - med)))
+        keep = np.abs(r - med) <= max(RECT_OUTLIER_MAD * mad, RECT_OUTLIER_PX)
+    if int(keep.sum()) < 2:
+        return base
+    k, h0 = np.polyfit(s[keep], hh[keep], 1)
+    r = hh - (k * s + h0)
+    resid = float(np.sqrt(np.mean(r[keep] ** 2)))
+    frac = float(keep.sum()) / len(P)
+    m = n - k * u
+    m = m / np.linalg.norm(m)
+    c = float(m @ mid + h0)
+    p0 = mid + u * (-L / 2.0) + n * (k * (-L / 2.0) + h0)
+    p1 = mid + u * (L / 2.0) + n * (k * (L / 2.0) + h0)
+    dirv = np.array([-m[1], m[0]])          # 边的方向（m 是法向）
+    ang = float(np.degrees(np.arctan2(dirv[1], dirv[0])))
+    while ang <= -90.0:
+        ang += 180.0
+    while ang > 90.0:
+        ang -= 180.0
+    base.update(n_inlier=int(keep.sum()), resid_px=resid,
+                ok=(frac >= RECT_MIN_INLIER_FRAC), p0=p0, p1=p1,
+                line=(float(m[0]), float(m[1]), c), angle_deg=ang)
+    return base
+
+
+def _line_dir(line):
+    a, b, _ = line
+    return np.array([-b, a], float)
+
+
+def _line_intersect(l1, l2):
+    a1, b1, c1 = l1
+    a2, b2, c2 = l2
+    det = a1 * b2 - a2 * b1
+    if abs(det) < 1e-9:
+        return None
+    return np.array([(c1 * b2 - c2 * b1) / det, (a1 * c2 - a2 * c1) / det], float)
+
+
+def _line_pair(l1, l2):
+    """两条对边的距离（法向统一朝外后取 |Δc|）+ 平行偏差（度）。"""
+    a1, b1, c1 = l1
+    a2, b2, c2 = l2
+    dot = a1 * a2 + b1 * b2
+    if dot < 0:
+        a2, b2, c2 = -a2, -b2, -c2
+        dot = -dot
+    par = float(np.degrees(np.arccos(np.clip(dot, -1.0, 1.0))))
+    return float(abs(c1 - c2)), par
+
+
+def refine_rect(gray, rect):
+    """四条边亚像素精定位 + 鲁棒直线拟合 + 矩形几何量。
+
+    输出（ok=True 时）：
+        side_a_px / side_b_px   两组**对边间距**（a 是较长的那组）
+        side_lengths            四条边（把直边延长到虚拟角点）
+        diagonals               两条对角线
+        parallel_dev / perp_dev 平行/垂直偏差（证据，不是判合格）
+        aspect                  a/b
+        angle                   长边方向角（-90, 90]
+        sides                  逐边证据：点数/内点/残差/落差 + 拟合线段端点
+    """
+    corners = _rect_corners(rect)
+    center = corners.mean(axis=0)
+    pol = _rect_part_polarity(gray, corners, center)
+    gray_f = cv2.GaussianBlur(gray, (0, 0), 1.0).astype(np.float32)
+
+    sides = []
+    for i in range(4):
+        s = _refine_rect_side(gray_f, corners[i], corners[(i + 1) % 4], center, pol)
+        s["idx"] = i + 1
+        s["coarse_len_px"] = float(np.linalg.norm(corners[(i + 1) % 4] - corners[i]))
+        sides.append(s)
+
+    warnings = []
+    out = {"ok": False, "fail": None, "rect": rect, "center": tuple(center),
+           "part_polarity": pol, "sides": sides, "warnings": warnings,
+           "thresh": None, "rectness": None, "corners": [tuple(p) for p in corners]}
+    for s in sides:
+        if s["ok"] and s["resid_px"] > 1.0:
+            warnings.append(f"第 {s['idx']} 条边残差 {s['resid_px']:.2f}px 偏大"
+                            "（边不直/倒角/高光）")
+        if s["n"] and s["n_inlier"] / s["n"] < 0.80:
+            warnings.append(f"第 {s['idx']} 条边内点只占 {s['n_inlier']}/{s['n']}")
+    bad = [s for s in sides if not s["ok"]]
+    if bad:
+        out["fail"] = "bad_sides"
+        warnings.append(f"有 {len(bad)} 条边拟合失败（低对比度/离焦/遮挡）")
+        return out
+
+    lines = [s["line"] for s in sides]
+    d0, par0 = _line_pair(lines[0], lines[2])
+    d1, par1 = _line_pair(lines[1], lines[3])
+    len0 = sides[0]["coarse_len_px"]
+    len1 = sides[1]["coarse_len_px"]
+    # 注意：**两条长边的间距才是短边方向**，反过来也一样。
+    # a_px 要的是"长边方向的总尺寸"（两条短边之间的距离）；a_idx 仍是长边的下标（取方向角用）。
+    if len0 >= len1:              # 边 0/2 是长边 -> 间距 d0 是短边方向
+        a_px, par_a, b_px, par_b, a_idx = d1, par1, d0, par0, 0
+    else:                         # 边 1/3 是长边 -> 间距 d1 是短边方向
+        a_px, par_a, b_px, par_b, a_idx = d0, par0, d1, par1, 1
+
+    pts = []
+    for i in range(4):
+        p = _line_intersect(lines[i], lines[(i + 1) % 4])
+        if p is None:
+            out["fail"] = "not_rect"
+            warnings.append("相邻边接近平行，无法求角点")
+            return out
+        pts.append(p)
+    lengths = [float(np.linalg.norm(pts[(i + 1) % 4] - pts[i])) for i in range(4)]
+    diags = [float(np.linalg.norm(pts[2] - pts[0])),
+             float(np.linalg.norm(pts[3] - pts[1]))]
+    diag_diff = abs(diags[0] - diags[1])
+    diag_pct = 100.0 * diag_diff / max(1e-9, (diags[0] + diags[1]) / 2.0)
+    perp = []
+    for i in range(4):
+        d1v = _line_dir(lines[i])
+        d2v = _line_dir(lines[(i + 1) % 4])
+        ang = float(np.degrees(np.arccos(
+            np.clip(abs(float(np.dot(d1v, d2v))), -1.0, 1.0))))
+        perp.append(90.0 - ang)
+    long_dir = _line_dir(lines[a_idx])
+    ang_deg = float(np.degrees(np.arctan2(long_dir[1], long_dir[0])))
+    while ang_deg <= -90.0:
+        ang_deg += 180.0
+    while ang_deg > 90.0:
+        ang_deg -= 180.0
+
+    out.update(ok=True, fail=None, center=tuple(np.array(pts).mean(axis=0)),
+               corners=[tuple(p) for p in pts], lines=lines,
+               side_a_px=float(a_px), side_b_px=float(b_px),
+               parallel_dev=[float(par_a), float(par_b)],
+               perp_dev=[float(v) for v in perp],
+               side_lengths=lengths, diagonals=diags,
+               diag_diff_px=float(diag_diff), diag_diff_pct=float(diag_pct),
+               aspect=float(a_px / max(1e-9, b_px)), angle=ang_deg)
+    for i, s in enumerate(sides):
+        s["length_px"] = float(lengths[i])   # 虚拟角点边长（圆角不会让它变短）
+
+    max_perp = max(abs(v) for v in perp)
+    if par_a > RECT_FAIL_PARALLEL_DEG or par_b > RECT_FAIL_PARALLEL_DEG:
+        out.update(ok=False, fail="not_rect")
+        warnings.append(f"对边不平行（{par_a:.2f}°/{par_b:.2f}°），矩形假设不成立")
+    if max_perp > RECT_FAIL_PERP_DEG:
+        out.update(ok=False, fail="not_rect")
+        warnings.append(f"相邻边不垂直（最大 {max_perp:.2f}°）")
+    if par_a > RECT_WARN_PARALLEL_DEG or par_b > RECT_WARN_PARALLEL_DEG:
+        warnings.append(f"对边平行偏差 {par_a:.2f}°/{par_b:.2f}°：像面有透视或零件倾斜")
+    if max_perp > RECT_WARN_PERP_DEG:
+        warnings.append(f"相邻边垂直偏差最大 {max_perp:.2f}°")
+    if diag_pct > RECT_WARN_DIAG_PCT:
+        warnings.append(f"两条对角线差 {diag_pct:.2f}%：像面有透视或零件倾斜")
+    return out
+
+
 def _main(argv):
     """自检：只打印外圈定位结果（真正的测量入口是 measure_ring.py）。"""
     path = argv[1] if len(argv) > 1 else "data/captures/measure_ring_latest.jpg"

@@ -49,7 +49,8 @@ from tkinter import messagebox, ttk  # noqa: E402
 import config  # noqa: E402
 from camera_adapter import create_camera  # noqa: E402
 from concentric import POLARITY_NAME as POLARITY_CN  # noqa: E402
-from measure_ring import MeasureError, build_parser, measure  # noqa: E402
+from measure_ring import (MeasureError, build_parser, measure, measure_rect,
+                          run_thickness_on_frame)  # noqa: E402
 
 LOG_PATH = PROJECT_ROOT / "debug" / "gui_error.log"
 RUN_LOG = PROJECT_ROOT / "debug" / "gui_run.log"
@@ -148,6 +149,7 @@ class LiveSource:
         self._thread = None
         self._stop = threading.Event()
         self._measure_req = threading.Event()
+        self._thickness_req = threading.Event()
         self._paused = threading.Event()
         self.preview_q = queue.Queue(maxsize=1)
         self.event_q = queue.Queue()
@@ -166,6 +168,10 @@ class LiveSource:
 
     def request_measure(self):
         self._measure_req.set()
+
+    def request_thickness(self):
+        """侧视厚度：同一个后台线程取一帧、量厚度（绝不另开线程碰相机）。"""
+        self._thickness_req.set()
 
     def set_paused(self, on: bool):
         if on:
@@ -208,6 +214,11 @@ class LiveSource:
                     self._do_measure()
                     last = time.perf_counter()
                     continue
+                if self._thickness_req.is_set():
+                    self._thickness_req.clear()
+                    self._do_thickness()
+                    last = time.perf_counter()
+                    continue
                 if self._paused.is_set():
                     time.sleep(0.03)
                     continue
@@ -242,14 +253,34 @@ class LiveSource:
                 out = Path("data/captures") / "measure_ring_latest.jpg"
                 out.parent.mkdir(parents=True, exist_ok=True)
                 cv2.imwrite(str(out), frame)
-            res = measure(frame, self.args)     # 内含落盘：调试图 + 文字报告
+            if getattr(self.args, "shape", "circle") == "rect":
+                res = measure_rect(frame, self.args)   # 内含落盘：标注图 + 报告
+                kind = "rect"
+            else:
+                res = measure(frame, self.args)        # 内含落盘：调试图 + 文字报告
+                kind = "result"
         except BaseException as e:              # noqa: BLE001
             self.event_q.put(("error", e))
             return
         self.measured += 1
         # 画好轮廓的结果图也编码一份，窗口直接显示（画面就此冻结，便于读数）
         thumb = self._encode(res.debug_img) if res.debug_img is not None else None
-        self.event_q.put(("result", (res, thumb)))
+        self.event_q.put((kind, (res, thumb)))
+
+    def _do_thickness(self):
+        """侧视厚度：取一帧量顶面-台面。数值与落盘都在 measure_ring，窗口不重算。"""
+        try:
+            frame = self._cam.capture()
+            if not self.args.image:
+                out = Path("data/captures") / "thickness_latest.jpg"
+                out.parent.mkdir(parents=True, exist_ok=True)
+                cv2.imwrite(str(out), frame)
+            res = run_thickness_on_frame(frame, self.args)
+        except BaseException as e:              # noqa: BLE001
+            self.event_q.put(("error", e))
+            return
+        thumb = self._encode(res.debug_img) if res.debug_img is not None else None
+        self.event_q.put(("thickness", (res, thumb)))
 
     # ---------------- 图像处理 ----------------
     def _encode(self, frame):
@@ -296,8 +327,13 @@ class MeasureWindow:
     def __init__(self, root: tk.Tk, args):
         self.root = root
         self.args = args
+        self.shape = getattr(args, "shape", "circle")   # circle / rect（启动时固定）
         self.ui = pick_font(root)
         self.result = None
+        self.thick_result = None
+        self._mode = "diameter"         # 最近一次请求的模式（出错时决定重置哪一栏）
+        self.last_debug = None          # 最近一次（外径或厚度）的调试图
+        self.last_report = None         # 最近一次（外径或厚度）的报告
         self._auto_done = False
         self._measuring = False
         self._img_ref = None            # 必须持引用，否则 PhotoImage 被回收显示空白
@@ -315,13 +351,15 @@ class MeasureWindow:
     # ---------------- 界面搭建 ----------------
     def _build(self):
         root = self.root
-        root.title("圆环尺寸测量 - SurfaceIQ")
+        rect_mode = self.shape == "rect"
+        root.title("方形尺寸测量 - SurfaceIQ" if rect_mode else "圆环尺寸测量 - SurfaceIQ")
         root.configure(bg=COLOR_BG)
 
         # 顶部：标题 / 测量时间 / 帧率 / 状态徽标
         head = tk.Frame(root, bg=COLOR_BG)
         head.pack(fill="x", padx=18, pady=(14, 4))
-        tk.Label(head, text="圆环尺寸测量", font=(self.ui, 17, "bold"),
+        tk.Label(head, text="方形尺寸测量" if rect_mode else "圆环尺寸测量",
+                 font=(self.ui, 17, "bold"),
                  bg=COLOR_BG, fg=COLOR_TEXT).pack(side="left")
         self.lbl_time = tk.Label(head, text="", font=(self.ui, 10),
                                  bg=COLOR_BG, fg=COLOR_MUTED)
@@ -336,12 +374,24 @@ class MeasureWindow:
         body = tk.Frame(root, bg=COLOR_BG)
         body.pack(fill="both", expand=True, padx=18, pady=(8, 0))
 
-        # 左列：最外那条（外缘）+ 同心边清单（条数不固定，所以是动态重建的 Frame）
+        # 左列：圆形=外缘+孔；方形=两组对边距+长宽比（清单条数不固定，动态重建）
         left = tk.Frame(body, bg=COLOR_BG)
         left.pack(side="left", anchor="n")
-        self.lbl_od = self._number_row(left, "外缘（#1）", 40)
-        self.lbl_holes = self._number_row(left, "孔（成组）", 14)
-        tk.Label(left, text="同心边清单（按半径由外向内；不命名，请对照图纸判断）",
+        if rect_mode:
+            self.lbl_od = self._number_row(left, "对边距 A（长边）", 40)
+            self.lbl_short = self._number_row(left, "对边距 B（短边）", 40)
+            self.lbl_aspect = self._number_row(left, "长宽比 A/B", 20, unit="")
+            self.lbl_thick = self._number_row(left, "厚度（侧视）", 24)
+        else:
+            self.lbl_od = self._number_row(left, "外缘（#1）", 40)
+            self.lbl_holes = self._number_row(left, "孔（成组）", 14)
+            self.lbl_thick = self._number_row(left, "厚度（侧视）", 30)
+        self.lbl_thick_detail = tk.Label(left, text="未测厚度", font=(self.ui, 9),
+                                         bg=COLOR_BG, fg=COLOR_MUTED,
+                                         justify="left", anchor="w")
+        self.lbl_thick_detail.pack(anchor="w", pady=(0, 10))
+        tk.Label(left, text=("四条边（按轮廓顺时针；不命名，请对照图纸判断）" if rect_mode
+                             else "同心边清单（按半径由外向内；不命名，请对照图纸判断）"),
                  font=(self.ui, 10), bg=COLOR_BG, fg=COLOR_MUTED).pack(anchor="w",
                                                                       pady=(4, 2))
         self.list_frame = tk.Frame(left, bg=COLOR_BG)
@@ -366,7 +416,8 @@ class MeasureWindow:
         self.canvas_text = self.canvas.create_text(
             self.view_w // 2, self.view_h // 2, text="正在打开相机…",
             font=(self.ui, 13), fill="#9ca3af")
-        tk.Label(right, text="绿=外缘   红=亮→暗边   品红=暗→亮边（编号与数值标在图上）",
+        tk.Label(right, text=("绿=拟合边   青=对边距（A 长边 / B 短边）" if rect_mode
+                              else "绿=外缘   红=亮→暗边   品红=暗→亮边（编号与数值标在图上）"),
                  font=(self.ui, 9), bg=COLOR_BG, fg=COLOR_MUTED).pack(pady=(4, 0))
 
         # 提醒 / 报错区（默认不显示，有内容才 pack）
@@ -383,6 +434,8 @@ class MeasureWindow:
         again_text = "重新测量 (空格)" if self.args.image else "再测一次 (空格)"
         self.btn_again = self._button(btns, again_text, self.do_measure, primary=True)
         self.btn_again.pack(side="left")
+        self.btn_thick = self._button(btns, "测厚度", self.do_thickness)
+        self.btn_thick.pack(side="left", padx=8)
         self.btn_pause = self._button(btns, "暂停取景 (P)", self.toggle_pause)
         self.btn_pause.pack(side="left", padx=8)
         self.btn_big = self._button(btns, "看大图", self.open_debug)
@@ -422,7 +475,7 @@ class MeasureWindow:
         root.geometry(f"+{x}+{y}")
         root.minsize(w, h)
 
-    def _number_row(self, parent, title, size, pady=(0, 10)):
+    def _number_row(self, parent, title, size, pady=(0, 10), unit=" mm"):
         """一行大数字：小标题 + 特大数字 + 单位。返回数字 Label 供更新。"""
         row = tk.Frame(parent, bg=COLOR_BG)
         row.pack(anchor="w", pady=pady)
@@ -433,9 +486,10 @@ class MeasureWindow:
         val = tk.Label(line, text="—", font=(self.ui, size, "bold"),
                        bg=COLOR_BG, fg=COLOR_TEXT)
         val.pack(side="left")
-        tk.Label(line, text=" mm", font=(self.ui, max(10, size * 2 // 5)),
-                 bg=COLOR_BG, fg=COLOR_MUTED).pack(side="left", anchor="s",
-                                                   pady=(0, size // 4))
+        if unit:
+            tk.Label(line, text=unit, font=(self.ui, max(10, size * 2 // 5)),
+                     bg=COLOR_BG, fg=COLOR_MUTED).pack(side="left", anchor="s",
+                                                       pady=(0, size // 4))
         return val
 
     def _button(self, parent, text, command, primary=False):
@@ -467,6 +521,7 @@ class MeasureWindow:
         if not self.src.is_ready() or self._measuring:
             return                          # 相机没就绪，或上一次还没测完
         self._measuring = True
+        self._mode = "rect" if self.shape == "rect" else "diameter"
         # 先冻结画面再测，结果图才不会被后续预览帧冲掉
         self.src.set_paused(True)
         self._sync_pause_button()
@@ -474,11 +529,31 @@ class MeasureWindow:
         self.btn_again.config(state="disabled")
         self.src.request_measure()
 
+    def do_thickness(self):
+        """侧视厚度：需要先换 0.3x 远心镜头并架水平、背光就位。"""
+        if not self.src.is_ready() or self._measuring:
+            return
+        self._frozen = False
+        self._measuring = True
+        self._mode = "thickness"
+        self.src.set_paused(True)
+        self._sync_pause_button()
+        self._set_status("测厚度中", COLOR_BUSY)
+        self.btn_again.config(state="disabled")
+        self.btn_thick.config(state="disabled")
+        self.src.request_thickness()
+
     def _auto_measure(self):
-        """启动后自动测一次：车间双击就该直接出结果，不用按键。"""
+        """启动后自动测一次：车间双击就该直接出结果，不用按键。
+
+        `--mode thickness` 启动时自动测厚度（此时相机上应该是 0.3x 远心）。
+        """
         if not self._auto_done and self.src.is_ready():
             self._auto_done = True
-            self.do_measure()
+            if getattr(self.args, "mode", "diameter") == "thickness":
+                self.do_thickness()
+            else:
+                self.do_measure()
 
     def toggle_pause(self):
         self.src.set_paused(not self.src.is_paused())
@@ -492,12 +567,12 @@ class MeasureWindow:
         self.btn_pause.config(text="继续取景 (P)" if self.src.is_paused() else "暂停取景 (P)")
 
     def open_debug(self):
-        if self.result is not None and self.result.debug_jpg:
-            _open_file(self.result.debug_jpg)
+        if self.last_debug:
+            _open_file(self.last_debug)
 
     def open_report(self):
-        if self.result is not None and self.result.report_txt:
-            _open_file(self.result.report_txt)
+        if self.last_report:
+            _open_file(self.last_report)
 
     # ---------------- 轮询：后台线程的东西只在这里落地 ----------------
     def _poll(self):
@@ -521,6 +596,10 @@ class MeasureWindow:
                 self.root.after(AUTO_MEASURE_DELAY_MS, self._auto_measure)
             elif kind == "result":
                 self._render_result(*payload)
+            elif kind == "rect":
+                self._render_rect_result(*payload)
+            elif kind == "thickness":
+                self._render_thickness(*payload)
             else:
                 self._render_error(payload)
 
@@ -554,6 +633,8 @@ class MeasureWindow:
     def _render_result(self, r, thumb):
         self.src.drain_preview()            # 结果图不许被残留预览帧冲掉
         self.result = r
+        self.last_debug = r.debug_jpg
+        self.last_report = r.report_txt
         self.lbl_time.config(text=r.timestamp.strftime("%Y-%m-%d %H:%M:%S"))
         self._set_status("已测量", COLOR_BUSY)
 
@@ -562,6 +643,21 @@ class MeasureWindow:
             self.lbl_od.config(text=f"{r.outer_px:.0f}(px)", fg=COLOR_MUTED)
         else:
             self.lbl_od.config(text=f"{r.outer_mm:.3f}", fg=COLOR_TEXT)
+
+        # 本次用的厚度 + 补偿前后系数：读数会因它变化，必须留在屏幕上
+        if r.thickness_mm is not None:
+            self.lbl_thick.config(text=f"{r.thickness_mm:.3f}", fg=COLOR_TEXT)
+            if r.height_applied and r.ratio_base is not None:
+                pct = (r.height_factor - 1.0) * 100.0
+                self.lbl_thick_detail.config(
+                    text=f"{r.thickness_src}\n系数 {r.ratio_base:.6f}→{r.ratio:.6f}"
+                         f"（{pct:+.2f}%）", fg=COLOR_TEXT)
+            else:
+                self.lbl_thick_detail.config(
+                    text=f"{r.thickness_src}\n未补偿：{r.height_note}", fg=COLOR_MUTED)
+        else:
+            self.lbl_thick.config(text="—", fg=COLOR_MUTED)
+            self.lbl_thick_detail.config(text=r.height_note or "未测厚度", fg=COLOR_MUTED)
 
         # 孔：一键测完直接显示，不需要二次操作。暗斑孔 / 亮环孔用不同后缀区分。
         if r.holes:
@@ -612,13 +708,147 @@ class MeasureWindow:
         self.canvas.itemconfig(self.canvas_text, state="hidden")
 
         self.btn_again.config(state="normal")
+        self.btn_thick.config(state="normal")
         self._sync_pause_button()
         self._measuring = False
         coef = (f"换算系数: {r.ratio:.6f} mm/px（{r.ratio_src}）" if r.ratio is not None
                 else f"换算系数: 无（{r.ratio_src}）")
+        if r.height_applied and r.ratio_base is not None:
+            coef += (f"\n高度补偿: {r.ratio_base:.6f} → {r.ratio:.6f} mm/px"
+                     f"（{(r.height_factor - 1.0) * 100:+.2f}%，t={r.thickness_mm:.2f}mm）")
         self.lbl_foot.config(
             text=f"图像: {r.src_desc}    {coef}"
                  f"    帧率: {self.src.fps:.1f} fps\n报告: {r.report_txt}")
+
+    def _render_rect_result(self, r, thumb):
+        """方形件：两组对边距 + 长宽比 + 逐边证据。数值全部来自 measure_rect。"""
+        self.src.drain_preview()
+        self.result = r
+        self.last_debug = r.debug_jpg
+        self.last_report = r.report_txt
+        self.lbl_time.config(text=r.timestamp.strftime("%Y-%m-%d %H:%M:%S"))
+        self._set_status("已测量", COLOR_BUSY)
+
+        # 没有机位系数时只显示像素：带 (px) 后缀 + 弱化颜色
+        if r.side_a_mm is None:
+            self.lbl_od.config(text=f"{r.side_a_px:.0f}(px)", fg=COLOR_MUTED)
+            self.lbl_short.config(text=f"{r.side_b_px:.0f}(px)", fg=COLOR_MUTED)
+        else:
+            self.lbl_od.config(text=f"{r.side_a_mm:.3f}", fg=COLOR_TEXT)
+            self.lbl_short.config(text=f"{r.side_b_mm:.3f}", fg=COLOR_TEXT)
+        self.lbl_aspect.config(text=f"{r.aspect:.4f}", fg=COLOR_TEXT)
+
+        # 厚度 + 补偿前后系数（与圆件同一套模型）
+        if r.thickness_mm is not None:
+            self.lbl_thick.config(text=f"{r.thickness_mm:.3f}", fg=COLOR_TEXT)
+            if r.height_applied and r.ratio_base is not None:
+                pct = (r.height_factor - 1.0) * 100.0
+                self.lbl_thick_detail.config(
+                    text=f"{r.thickness_src}\n系数 {r.ratio_base:.6f}→{r.ratio:.6f}"
+                         f"（{pct:+.2f}%）", fg=COLOR_TEXT)
+            else:
+                self.lbl_thick_detail.config(
+                    text=f"{r.thickness_src}\n未补偿：{r.height_note}", fg=COLOR_MUTED)
+        else:
+            self.lbl_thick.config(text="—", fg=COLOR_MUTED)
+            self.lbl_thick_detail.config(text=r.height_note or "未测厚度", fg=COLOR_MUTED)
+
+        for w in self.list_frame.winfo_children():
+            w.destroy()
+        for s in r.sides:
+            L = float(s.get("length_px") or s["coarse_len_px"])
+            mm = (f"{L * r.ratio:9.3f} mm" if r.ratio is not None else "      (px)")
+            tk.Label(self.list_frame,
+                     text=f"S{s['idx']:<2d} {L:8.1f} {mm}  角{s['angle_deg']:+6.2f}°  "
+                          f"残差{s['resid_px']:.2f}px  {s['n_inlier']}/{s['n']}",
+                     font=(self.ui, 12), bg=COLOR_BG, fg=COLOR_TEXT,
+                     anchor="w").pack(anchor="w")
+        tk.Label(self.list_frame,
+                 text=(f"对角差 {r.diag_diff_px:.2f}px（{r.diag_diff_pct:.2f}%）   "
+                       f"平行 {max(r.parallel_dev):.2f}°   "
+                       f"垂直 {max(abs(v) for v in r.perp_dev):.2f}°"),
+                 font=(self.ui, 10), bg=COLOR_BG, fg=COLOR_MUTED,
+                 anchor="w").pack(anchor="w")
+
+        msgs = ["⚠ " + w for w in r.warnings]
+        if r.ratio is None:
+            msgs.append("⚠ 机位没标定过：本次只有像素。"
+                        "用 --ref-mm <长边真值> 标定一次才有毫米。")
+        self._show_message("；\n".join(msgs) if msgs else None, "warn")
+
+        self.full_img = r.debug_img
+        self._frozen = True
+        self._zoom_reset()
+        self.canvas.itemconfig(self.canvas_text, state="hidden")
+
+        self.btn_again.config(state="normal")
+        self.btn_thick.config(state="normal")
+        self._sync_pause_button()
+        self._measuring = False
+        coef = (f"换算系数: {r.ratio:.6f} mm/px（{r.ratio_src}）" if r.ratio is not None
+                else f"换算系数: 无（{r.ratio_src}）")
+        if r.height_applied and r.ratio_base is not None:
+            coef += (f"\n高度补偿: {r.ratio_base:.6f} → {r.ratio:.6f} mm/px"
+                     f"（{(r.height_factor - 1.0) * 100:+.2f}%，t={r.thickness_mm:.2f}mm）")
+        self.lbl_foot.config(
+            text=f"图像: {r.src_desc}    {coef}"
+                 f"    帧率: {self.src.fps:.1f} fps\n报告: {r.report_txt}")
+
+    def _render_thickness(self, r, thumb):
+        """侧视厚度：大字 + 顶面/台面/倾斜明细 + 调试图。数值来自 ThicknessResult。"""
+        self.src.drain_preview()
+        self.thick_result = r
+        self.last_debug = r.debug_jpg
+        self.last_report = r.report_txt
+        self.lbl_time.config(text=r.timestamp.strftime("%Y-%m-%d %H:%M:%S"))
+        if r.ok and r.mm is not None:
+            self._set_status("已测厚度", COLOR_BUSY)
+        elif r.ok:
+            self._set_status("厚度未标定", COLOR_BUSY)
+        else:
+            self._set_status("厚度失败", COLOR_NG)
+        if r.mm is not None:
+            self.lbl_thick.config(text=f"{r.mm:.3f}", fg=COLOR_TEXT)
+        elif r.px is not None:
+            self.lbl_thick.config(text=f"{r.px:.0f}(px)", fg=COLOR_MUTED)
+        else:
+            self.lbl_thick.config(text="—", fg=COLOR_MUTED)
+
+        if r.ok:
+            detail = (f"顶面 y={r.part_y:.1f}  台面 y={r.base_y:.1f}px"
+                      f"（{r.px:.1f}px）\n"
+                      f"倾斜 {r.part_tilt_deg:+.2f}°/{r.base_tilt_deg:+.2f}°"
+                      f"  MAD {max(r.part_mad_px, r.base_mad_px):.1f}px")
+        else:
+            detail = r.note or "厚度测量失败"
+        self.lbl_thick_detail.config(text=detail, fg=COLOR_TEXT if r.ok else COLOR_NG)
+
+        msgs = []
+        if r.ok and r.mm is None:
+            msgs.append("只给了像素：先跑 `--mode thickness --side-ref-mm <量块真值>` 标定")
+        if r.ok and r.mm is not None:
+            msgs.append("厚度已写入缓存；换回顶视镜头后，外径测量会自动读取并补偿")
+        if r.note:
+            msgs.append(r.note)
+        self._show_message("；\n".join(msgs) if msgs else None,
+                           "warn" if r.ok else "error")
+
+        if thumb is not None:
+            self._show_image(thumb)
+        self.full_img = r.debug_img
+        self._frozen = True
+        self._zoom_reset()
+        self.canvas.itemconfig(self.canvas_text, state="hidden")
+
+        self.btn_again.config(state="normal")
+        self.btn_thick.config(state="normal")
+        self._sync_pause_button()
+        self._measuring = False
+        calib = (f"侧视标定: {r.mm_per_px:.6f} mm/px" if r.mm_per_px is not None
+                 else "侧视标定: 无（只给像素）")
+        self.lbl_foot.config(
+            text=f"图像: {r.src_desc}    {calib}\n"
+                 f"报告: {r.report_txt}    调试图: {r.debug_jpg}")
 
     def _zoom_by(self, factor):
         """按倍数缩放结果图。只在"冻结着一次结果"时有效（实时取景不缩放）。"""
@@ -670,10 +900,18 @@ class MeasureWindow:
     def _render_error(self, exc):
         self._set_status("出错", COLOR_NG)
         self.btn_again.config(state="normal")
+        self.btn_thick.config(state="normal")
         self._sync_pause_button()
         self._measuring = False
         # 测失败就别把上一次的读数留在屏幕上误导人
-        self.lbl_od.config(text="—", fg=COLOR_MUTED)
+        if self._mode == "thickness":
+            self.lbl_thick.config(text="—", fg=COLOR_MUTED)
+            self.lbl_thick_detail.config(text="厚度测量失败", fg=COLOR_NG)
+        else:
+            self.lbl_od.config(text="—", fg=COLOR_MUTED)
+            if self.shape == "rect":        # 别把上一次的方形读数留在屏幕上误导人
+                self.lbl_short.config(text="—", fg=COLOR_MUTED)
+                self.lbl_aspect.config(text="—", fg=COLOR_MUTED)
         for w in self.list_frame.winfo_children():
             w.destroy()
         brief = friendly_error(exc)

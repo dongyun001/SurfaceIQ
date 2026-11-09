@@ -164,3 +164,115 @@ def draw_listing(img, res, ratio=None, label_filter=None, holes=None):
         ty = float(np.clip(ty, PAD + 12, out.shape[0] - PAD))
         cv2.putText(out, text, (int(tx), int(ty)), FONT, 0.8, COLOR_HOLE, 2, cv2.LINE_AA)
     return out
+
+
+# ---------------- 方形件标注 ----------------
+# 与同心边同一个原则：**图上文字只能 ASCII**（putText 画不了中文）；存盘走 imencode+tofile。
+COLOR_RECT_EDGE = (0, 220, 0)      # 四条拟合边（绿）
+COLOR_RECT_DIM = (255, 170, 0)     # 对边距（蓝绿）
+COLOR_RECT_MARK = (0, 255, 255)    # 角点 / 中心（黄）
+
+
+def draw_rect(img, res, ratio=None):
+    """画方形件的四条拟合边 + 对边距 + 角点，返回新图。
+
+    标签形如 `S1 1921.9px 83.75mm` / `A 1917.1px 85.48mm` / `ang +4.29deg`。
+    与 `draw_listing` 一样只做排版，数值全部来自 `measure_ring.RectResult`。
+    """
+    out = img.copy()
+    if out.ndim == 2:
+        out = cv2.cvtColor(out, cv2.COLOR_GRAY2BGR)
+    h, w = out.shape[:2]
+    sides = res.get("sides") or []
+    if not sides:
+        return out
+    center = np.array(res.get("center") or (w / 2.0, h / 2.0), float)
+
+    # ---- 四条边 + 编号/长度 ----
+    for s in sides:
+        if s.get("p0") is None or s.get("p1") is None:
+            continue
+        p0 = np.array(s["p0"], float)
+        p1 = np.array(s["p1"], float)
+        cv2.line(out, tuple(np.round(p0).astype(int)),
+                 tuple(np.round(p1).astype(int)), COLOR_RECT_EDGE, 3, cv2.LINE_AA)
+        cv2.circle(out, tuple(np.round(p0).astype(int)), 6, COLOR_RECT_MARK, -1)
+        d = p1 - p0
+        L = float(np.linalg.norm(d))
+        if L <= 0:
+            continue
+        u = d / L
+        n = np.array([-u[1], u[0]])
+        mid = (p0 + p1) / 2.0
+        if np.dot(n, mid - center) < 0:
+            n = -n
+        side_len = float(s.get("length_px") or s.get("coarse_len_px") or 0.0)
+        text = f"S{s['idx']} {side_len:.1f}px"
+        if ratio is not None:
+            text += f" {side_len * ratio:.2f}mm"
+        (tw, th), _ = cv2.getTextSize(text, FONT, 0.8, 2)
+        tx, ty = mid + n * 55.0
+        tx = tx - tw if n[0] < 0 else tx
+        tx = float(np.clip(tx, PAD, max(PAD, w - PAD - tw)))
+        ty = float(np.clip(ty, PAD + th, h - PAD))
+        edge_x = tx if mid[0] < tx else tx + tw
+        cv2.line(out, tuple(np.round(mid).astype(int)), (int(edge_x), int(ty - th / 2)),
+                 COLOR_RECT_EDGE, 1, cv2.LINE_AA)
+        cv2.putText(out, text, (int(tx), int(ty)), FONT, 0.8, COLOR_RECT_EDGE, 2,
+                    cv2.LINE_AA)
+
+    # ---- 对边距：从一条边的中点沿法向投到对边 ----
+    lines = res.get("lines") or []
+    if len(lines) == 4 and len(sides) == 4 and all(
+            sides[i].get("p0") is not None for i in range(4)):
+        long_i = 0 if (sides[0].get("coarse_len_px", 0.0)
+                       >= sides[1].get("coarse_len_px", 0.0)) else 1
+        # A（长边方向总尺寸）= 两条**短边**的间距；B = 两条**长边**的间距。
+        # 两条尺寸线在中心交叉，文字必须沿各自的线错开，否则会叠在一起。
+        for tag, i, j, val, frac in (
+                ("A", (long_i + 1) % 4, (long_i + 3) % 4,
+                 res.get("side_a_px"), 0.25),
+                ("B", long_i, (long_i + 2) % 4, res.get("side_b_px"), 0.75)):
+            if val is None:
+                continue
+            p0 = np.array(sides[i]["p0"], float)
+            p1 = np.array(sides[i]["p1"], float)
+            mid = (p0 + p1) / 2.0
+            d = p1 - p0
+            L = float(np.linalg.norm(d))
+            if L <= 0:
+                continue
+            u = d / L
+            n = np.array([-u[1], u[0]])
+            if np.dot(n, mid - center) < 0:
+                n = -n
+            a2, b2, c2 = lines[j]
+            n2 = np.array([a2, b2], float)
+            denom = float(np.dot(n2, n))
+            if abs(denom) < 1e-9:
+                continue
+            t = (c2 - float(np.dot(n2, mid))) / denom
+            q = mid + n * t
+            cv2.line(out, tuple(np.round(mid).astype(int)),
+                     tuple(np.round(q).astype(int)), COLOR_RECT_DIM, 2, cv2.LINE_AA)
+            text = f"{tag} {val:.1f}px"
+            if ratio is not None:
+                text += f" {val * ratio:.2f}mm"
+            (tw, th), _ = cv2.getTextSize(text, FONT, 0.8, 2)
+            tm = mid + (q - mid) * frac + u * 18.0
+            tx = float(np.clip(tm[0] - tw / 2.0, PAD, max(PAD, w - PAD - tw)))
+            ty = float(np.clip(tm[1] + th / 2.0, PAD + th, h - PAD))
+            cv2.putText(out, text, (int(tx), int(ty)), FONT, 0.8, COLOR_RECT_DIM, 2,
+                        cv2.LINE_AA)
+
+    # ---- 中心 + 长边方向角（角度放左上角，别和 A/B 文字抢中心）----
+    c = tuple(np.round(center).astype(int))
+    cv2.drawMarker(out, c, COLOR_RECT_MARK, cv2.MARKER_CROSS, 36, 2)
+    ang = res.get("angle")
+    if ang is not None:
+        txt = f"ang {ang:+.2f}deg"
+        if res.get("rectness") is not None:
+            txt += f"  rectness {res['rectness']:.3f}"
+        cv2.putText(out, txt, (PAD, PAD + 18), FONT, 0.7, COLOR_RECT_MARK, 2,
+                    cv2.LINE_AA)
+    return out

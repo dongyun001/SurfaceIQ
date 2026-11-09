@@ -12,9 +12,13 @@ r"""零件尺寸测量：**列出检出的一条条同心边**（不命名、不
     1) 图形界面（日常用，推荐）：双击项目里的 `测量.bat`
        - 相机已接：自动拍照 → 弹出结果窗口（标注图 + 清单）
        - 想测已有照片：把照片文件拖到 `测量.bat` 图标上
+       - 换上 0.3x 远心镜头后，点「测厚度」按钮走侧视厚度
     2) 命令行（标定 / 排错用）：项目根目录 vision-roughness/ 下
        python src\measure_ring.py --image data\captures\xxx.jpg
        python src\measure_ring.py --image <该机位的图> --ref-mm 88.28   # 标定机位系数
+       python src\measure_ring.py --mode thickness --side-ref-mm 9.0    # 标定侧视厚度系数
+       python src\measure_ring.py --mode thickness                      # 测厚度（写缓存）
+       python src\measure_ring.py --image <图> --thickness 6.5          # 外径+高度补偿
 
 每次测量会在 debug\ 下存两份记录：measure_ring_debug.jpg（标注图）
 和 报告_年月日_时分秒.txt（文字报告）。
@@ -46,6 +50,7 @@ import annotate
 import concentric
 import config
 import fit_ellipse_ring
+import thickness
 from camera_adapter import create_camera
 
 RIG_PATH = Path("models/rig.json")     # 机位档案（mm/px 的唯一真相源）
@@ -99,6 +104,13 @@ class RingResult:
     holes_note: str = ""                        # 孔的排列结论 / 失败原因
     outer_cue: str = "intensity"                # 外缘取边路径：intensity / intensity_weak / texture_mid
     outer_cue_info: dict = field(default_factory=dict)
+    # ---- 厚度 / 高度补偿 ----
+    thickness_mm: Optional[float] = None        # 本次用的厚度（None = 没有，未补偿）
+    thickness_src: str = ""                     # 来源说明（缓存/命令行/未提供）
+    ratio_base: Optional[float] = None          # 补偿前的机位系数
+    height_factor: float = 1.0                  # 补偿倍数（1.0 = 未补偿）
+    height_applied: bool = False
+    height_note: str = ""                       # 未补偿的原因 / 告警
     tilt: float = 1.0
     touches_border: bool = False
     warnings: list = field(default_factory=list)
@@ -108,20 +120,82 @@ class RingResult:
     debug_img: Optional[np.ndarray] = None         # 标注图（GUI 缩略图用）
 
 
+@dataclass
+class RectResult:
+    """一次**方形/矩形件**测量的全部结果（与 RingResult 并列，不混用字段）。
+
+    `side_a_px` / `side_b_px` 是两组**对边间距**（a = 较长的那组）；四条边长是把
+    直边延长到虚拟角点后算的，圆角不会让它们变短。`aspect = a/b`：真方形接近 1，
+    矩形件就是长宽比——**这不是"方形度合格判据"**，只是证据。
+    """
+    src_desc: str
+    timestamp: datetime
+    ratio: Optional[float]
+    ratio_src: str
+    side_a_px: float
+    side_b_px: float
+    side_a_mm: Optional[float]
+    side_b_mm: Optional[float]
+    side_lengths: list
+    side_lengths_mm: list
+    diagonals: list
+    diag_diff_px: float
+    diag_diff_pct: float
+    aspect: float
+    angle: float
+    parallel_dev: list
+    perp_dev: list
+    sides: list
+    center: tuple
+    thresh: float
+    rectness: float
+    # ---- 厚度 / 高度补偿（与圆件同一套模型）----
+    thickness_mm: Optional[float] = None
+    thickness_src: str = ""
+    ratio_base: Optional[float] = None
+    height_factor: float = 1.0
+    height_applied: bool = False
+    height_note: str = ""
+    warnings: list = field(default_factory=list)
+    lines: list = field(default_factory=list)
+    debug_jpg: Optional[Path] = None
+    report_txt: Optional[Path] = None
+    debug_img: Optional[np.ndarray] = None
+
+
 def build_parser() -> argparse.ArgumentParser:
     """命令行参数。GUI 复用同一套，保证拖照片/标定两种用法参数一致。"""
-    p = argparse.ArgumentParser(description="零件同心边尺寸测量（不命名、不判合格）")
+    p = argparse.ArgumentParser(description="零件尺寸测量（不命名、不判合格）")
+    p.add_argument("--shape", choices=["circle", "rect"], default="circle",
+                   help="circle=圆形件（默认，列同心边）；"
+                        "rect=方形/矩形件（四条边，按对边距出宽高）")
+    p.add_argument("--mode", choices=["diameter", "thickness"], default="diameter",
+                   help="diameter=同心边/孔（默认）；thickness=侧视厚度"
+                        "（同一台相机换 0.3x 远心镜头后使用）")
     p.add_argument("--image", help="测已有照片；不指定则相机现拍")
     p.add_argument("--ref-mm", type=float,
-                   help="零件外径卡尺真值(mm)，用于标定**机位**的换算系数（会写回 models/rig.json）")
+                   help="卡尺真值(mm)，用于标定**机位**的换算系数（会写回 models/rig.json）；"
+                        "圆形件=外径，方形件=长边")
     p.add_argument("--mm-per-px", type=float, help="直接指定 mm/px（临时用，不写回档案）")
+    p.add_argument("--thickness", type=float,
+                   help="本次零件厚度/顶面高度(mm)，用于高度补偿；优先于厚度缓存")
+    p.add_argument("--no-height", action="store_true",
+                   help="本次不做高度补偿（对比/排错用）")
+    p.add_argument("--side-ref-mm", type=float,
+                   help="厚度标定：量块真值高度(mm)。配合 --mode thickness，"
+                        "把侧视 mm/px 写回 models/rig.json")
+    p.add_argument("--side-mm-per-px", type=float,
+                   help="临时指定侧视 mm/px（不写回档案，测试用）")
+    p.add_argument("--side-offset-mm", type=float,
+                   help="厚度偏置校正(mm)；默认用档案里的值（倒角/取边偏置）")
     p.add_argument("--all-edges", action="store_true",
-                   help="连'弱边'一起列。默认只列强边（+外缘）——弱边在低对比度件上**不稳定**"
-                        "（实测连拍 5 帧条数在 11~15 之间跳、直径极差 7~11%%），列出来会误导人")
+                   help="连'弱边'一起列（仅圆形模式）。默认只列强边（+外缘）——弱边在低对比度件上"
+                        "**不稳定**（实测连拍 5 帧条数在 11~15 之间跳、直径极差 7~11%%），"
+                        "列出来会误导人")
     return p
 
 
-def grab_image(args) -> np.ndarray:
+def grab_image(args, save_name: str = "measure_ring_latest.jpg") -> np.ndarray:
     """从相机拍一张，或从文件读一张，返回 BGR 图像。"""
     if args.image:
         img = cv2.imread(args.image)
@@ -131,32 +205,173 @@ def grab_image(args) -> np.ndarray:
     print("打开相机拍照...")
     with create_camera(config.CAMERA_TYPE, **config.CAMERA_KWARGS) as cam:
         frame = cam.capture()
-    out = Path("data/captures") / "measure_ring_latest.jpg"
+    out = Path("data/captures") / save_name
     out.parent.mkdir(parents=True, exist_ok=True)
     cv2.imwrite(str(out), frame)
     print(f"已保存: {out}")
     return frame
 
 
-def resolve_ratio(args, outer_dia_px):
-    """确定 mm/px，返回 (ratio 或 None, 来源说明)。
+def _height_model() -> dict:
+    return load_rig().get("height_model") or {}
+
+
+def resolve_ratio(args, ref_px, thickness_mm=None, what="外径"):
+    """确定 mm/px，返回 (ratio 或 None, 来源说明, 高度补偿信息)。
 
     唯一真相源是**机位档案** models/rig.json（全局一份）。拿不到就返回 None：
     调用方据此只报像素、不给毫米，而不是编一个数。
+
+    `ref_px` 是标定用的实测像素量：圆形件传外径，方形件传**长边对边距**；
+    `what` 只影响报告里的措辞（"外径真值" / "长边真值"），不改变算法。
+
+    高度补偿（`height_model.enabled=true` 且拿到厚度 t 时才生效）：
+        s(t) = mm_per_px × (1 + scale_per_mm × (t - thickness_ref_mm))
+    符号：顶面越高（越靠近镜头），真实 mm/px 越小 → scale_per_mm 是负数。
+    **只改毫米换算，不动任何像素读数。**
+
+    `--ref-mm` 标定时若同时给了厚度，会把系数**归一化到基准高度**再存盘，
+    保证 mm_per_px 始终是"基准厚度下"的系数，不出现第二套定义。
     """
+    hm = _height_model()
+    model_on = bool(hm.get("enabled")) and not getattr(args, "no_height", False)
+    t_ref = hm.get("thickness_ref_mm")
+    scale = hm.get("scale_per_mm")
+
+    info = {
+        "enabled": bool(hm.get("enabled")), "applied": False, "base": None,
+        "factor": 1.0, "t": thickness_mm, "t_ref": t_ref, "scale": scale,
+        "note": "",
+    }
+
+    factor = 1.0
+    if model_on and thickness_mm is not None and t_ref is not None and scale is not None:
+        factor = 1.0 + float(scale) * (float(thickness_mm) - float(t_ref))
+        info.update(factor=factor, applied=True)
+    elif not hm.get("enabled"):
+        info["note"] = "高度模型未启用（height_model.enabled=false）"
+    elif getattr(args, "no_height", False):
+        info["note"] = "命令行 --no-height：本次不做高度补偿"
+    else:
+        info["note"] = "本次没有厚度，未做高度补偿（先测厚度或用 --thickness）"
+
     if args.mm_per_px:
-        return float(args.mm_per_px), "命令行指定（临时，不写回档案）"
-    if args.ref_mm:
-        ratio = float(args.ref_mm) / outer_dia_px
-        src = (f"本次标定：外径真值 {args.ref_mm}mm / 检出 {outer_dia_px:.1f}px"
-               f"（图像 {args.image or '相机现拍'}）")
-        save_rig(ratio, src)
-        return ratio, src + "，已写回机位档案"
+        base = float(args.mm_per_px)
+        src = "命令行指定（临时，不写回档案）"
+    elif args.ref_mm:
+        measured = float(args.ref_mm) / ref_px
+        if info["applied"]:
+            base = measured / factor
+            src = (f"本次标定：{what}真值 {args.ref_mm}mm / 检出 {ref_px:.1f}px"
+                   f"（已按厚度 {thickness_mm:.2f}mm 归一化到基准 {float(t_ref):.2f}mm）")
+        else:
+            base = measured
+            src = (f"本次标定：{what}真值 {args.ref_mm}mm / 检出 {ref_px:.1f}px"
+                   f"（图像 {args.image or '相机现拍'}）")
+        save_rig(base, src)
+        src += "，已写回机位档案"
+        if info["enabled"] and not info["applied"] and t_ref is not None:
+            info["note"] = ("标定时没给 --thickness：系数按基准 "
+                            f"{float(t_ref):.2f}mm 存；若标定件不是这个厚度，高度补偿会偏")
+    else:
+        rig = load_rig()
+        if not rig.get("mm_per_px"):
+            return None, "机位没标定过（models/rig.json 里没有 mm_per_px）", info
+        base = float(rig["mm_per_px"])
+        src = f"机位档案（{rig.get('calibrated_at', '未知时间')} 标定）"
+
+    info["base"] = base
+    ratio = base * factor if info["applied"] else base
+    return ratio, src, info
+
+
+def resolve_thickness(args):
+    """本次测量要用的厚度，返回 (mm 或 None, 来源说明, 备注)。
+
+    优先级：`--thickness` > `config.THICKNESS.source`（latest=厚度缓存 / manual=不自动取）。
+    缓存带时间戳，过期就拒绝——宁可少补偿，也不拿上一次的厚度套到另一个零件上。
+    """
+    if getattr(args, "thickness", None) is not None:
+        return float(args.thickness), "命令行 --thickness", ""
+    cfg = getattr(config, "THICKNESS", {}) or {}
+    src = cfg.get("source", "latest")
+    if src == "manual":
+        return None, "未提供（THICKNESS.source=manual）", "没有厚度"
+    t, at, note = thickness.read_cache(float(cfg.get("max_age_min", 30)))
+    if t is None:
+        return None, note, note
+    return t, f"厚度缓存（{at}，侧视）", ""
+
+
+# ---------------- 侧视厚度（同一台相机换 0.3x 远心镜头） ----------------
+
+def load_side_calib() -> dict:
+    return (_height_model().get("side") or {})
+
+
+def save_side_calibration(mm_per_px: float, offset_mm: float, src: str) -> None:
+    """侧视 mm/px 写回机位档案的 height_model.side（与顶视 mm_per_px 分名字空间）。"""
     rig = load_rig()
-    if rig.get("mm_per_px"):
-        when = rig.get("calibrated_at", "未知时间")
-        return float(rig["mm_per_px"]), f"机位档案（{when} 标定）"
-    return None, "机位没标定过（models/rig.json 里没有 mm_per_px）"
+    hm = rig.setdefault("height_model", {})
+    side = hm.setdefault("side", {})
+    side["mm_per_px"] = float(mm_per_px)
+    side["offset_mm"] = float(offset_mm)
+    side["calibrated_at"] = datetime.now().strftime("%Y-%m-%d %H:%M")
+    side["from"] = src
+    RIG_PATH.write_text(json.dumps(rig, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def run_thickness_on_frame(frame: np.ndarray, args):
+    """对一帧侧视画面测厚度（CLI 与 GUI 共用；含落盘与缓存）。"""
+    side = load_side_calib()
+    mpp = getattr(args, "side_mm_per_px", None)
+    if mpp is None:
+        mpp = side.get("mm_per_px")
+    off = getattr(args, "side_offset_mm", None)
+    if off is None:
+        off = side.get("offset_mm", 0.0) or 0.0
+    cfg = getattr(config, "THICKNESS", {}) or {}
+    res = thickness.measure_thickness(
+        frame, cfg, mm_per_px=mpp, offset_mm=off,
+        src_desc=getattr(args, "image", None) or "相机现拍")
+    if res.ok and res.mm is not None:
+        thickness.write_cache(res)
+    thickness.save_outputs(res)
+    return res
+
+
+def run_thickness_mode(args) -> None:
+    """CLI 的 --mode thickness：标定或测厚度，打印报告后返回。"""
+    img = grab_image(args, save_name="thickness_latest.jpg")
+
+    if args.side_ref_mm is not None:
+        cfg = getattr(config, "THICKNESS", {}) or {}
+        res = thickness.measure_thickness(img, cfg, mm_per_px=None, offset_mm=0.0,
+                                          src_desc=args.image or "相机现拍")
+        if not res.ok or not res.px or res.px <= 0:
+            thickness.save_outputs(res)
+            raise MeasureError("厚度标定失败：" + (res.note or "没有量出像素差"))
+        mpp = thickness.side_mm_per_px(res, float(args.side_ref_mm))
+        off = float(args.side_offset_mm or 0.0)
+        src = (f"量块真值 {args.side_ref_mm}mm / 实测 {res.px:.1f}px"
+               f"（图像 {args.image or '相机现拍'}）")
+        save_side_calibration(mpp, off, src)
+        res.mm_per_px, res.offset_mm = mpp, off
+        res.mm = float(args.side_ref_mm)
+        res.lines = thickness.format_report(res)
+        res.lines.append(f"\n侧视标定已写回 {RIG_PATH}：{mpp:.6f} mm/px（{src}）")
+        thickness.save_outputs(res)
+        for ln in res.lines:
+            print(ln)
+        return
+
+    res = run_thickness_on_frame(img, args)
+    for ln in res.lines:
+        print(ln)
+    if not res.ok:
+        raise MeasureError("厚度测量失败（原因见上面的报告；调试图 debug/thickness_debug.jpg）")
+    if res.mm is None:
+        raise MeasureError("厚度没有标定：先跑 `--mode thickness --side-ref-mm <量块真值>`")
 
 
 # ---------------- 失败提示 ----------------
@@ -343,7 +558,8 @@ def measure(img: np.ndarray, args) -> RingResult:
 
     timestamp = datetime.now()
     src_desc = args.image or "相机现拍"
-    ratio, ratio_src = resolve_ratio(args, outer_dia_px)
+    t_mm, t_src, _ = resolve_thickness(args)
+    ratio, ratio_src, hinfo = resolve_ratio(args, outer_dia_px, t_mm)
     od_mm = None if ratio is None else outer_dia_px * ratio
 
     touches_border = (oa1 > img.shape[1] - BORDER_MARGIN * 2 or
@@ -382,6 +598,21 @@ def measure(img: np.ndarray, args) -> RingResult:
         unc = load_rig().get("uncertainty", "")
         _p(f"换算系数: {ratio:.6f} mm/px （来源: {ratio_src}）"
            + (f"  不确定度 {unc}" if unc else ""))
+
+    # ---- 厚度 / 高度补偿：它会让毫米读数变化，必须写清楚依据 ----
+    if t_mm is not None:
+        _p(f"厚度: {t_mm:.2f} mm（来源: {t_src}）")
+    if hinfo["applied"] and ratio is not None:
+        base = float(hinfo["base"])
+        pct = (float(hinfo["factor"]) - 1.0) * 100.0
+        _p(f"高度补偿: 基准 {float(hinfo['t_ref']):.2f} mm，"
+           f"{float(hinfo['scale']) * 100:+.3f}%/mm → "
+           f"{base:.6f} → {ratio:.6f} mm/px（{pct:+.2f}%）")
+        _p("    假定零件直接坐在同一基准台面上（有垫块时量的是顶面高度）；"
+           "残余约 ±0.17% 是取边带，不是厚度误差")
+    elif hinfo["enabled"] and hinfo["note"]:
+        _p(f"高度补偿: 未做 —— {hinfo['note']}")
+        warnings.append(hinfo["note"])
 
     tilt = max(oa1, oa2) / min(oa1, oa2)
     if tilt > 1.02:
@@ -472,16 +703,200 @@ def measure(img: np.ndarray, args) -> RingResult:
         hidden=hidden,
         holes=holes, holes_note=holes_note,
         outer_cue=cue, outer_cue_info=cue_info,
+        thickness_mm=t_mm, thickness_src=t_src,
+        ratio_base=hinfo.get("base"), height_factor=float(hinfo.get("factor", 1.0)),
+        height_applied=bool(hinfo.get("applied")), height_note=hinfo.get("note", ""),
         tilt=tilt, touches_border=touches_border, warnings=warnings, lines=lines,
+        debug_jpg=dbg_path, report_txt=rep_path, debug_img=dbg,
+    )
+
+
+def _rect_fail_message(img: np.ndarray, res: dict) -> str:
+    """方形件定位失败的具体原因。别退回一句笼统的"检查对焦/光照"。"""
+    fail = res.get("fail")
+    if fail == "out_of_frame":
+        return ("方形件超出画面：有边被画幅切掉了。\n"
+                "把零件挪到画面中间，或把相机抬高/后拉，让四条边都完整入画再测。")
+    if fail == "not_rect":
+        return ("找到的最大轮廓不是矩形——可能是圆形件、或背景里的大块阴影。\n"
+                "圆形件请用默认模式（--shape circle）；方形件请让四条边完整入画、"
+                "背景尽量干净。")
+    if fail == "too_small":
+        return ("方形件在画面里太小（短边不足画幅的 8%）。\n"
+                "请靠近或换更长焦的镜头，让零件至少占满画面的一半。")
+    if fail == "bad_sides":
+        bad = [s for s in (res.get("sides") or []) if not s.get("ok")]
+        detail = "；".join(f"第{s['idx']}条 {s['n_inlier']}/{s['n']} 点"
+                           for s in bad[:4])
+        return (f"有 {len(bad)} 条边拟合失败（{detail}）。\n"
+                "先补光、重新对焦，确保四条边都有足够对比度、且不被遮挡。")
+    g = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    mean, bright = float(g.mean()), float((g > 200).mean())
+    if mean < 60 or bright < 0.005:
+        return (f"没找到方形件的外轮廓：画面太暗（灰度均值 {mean:.0f}/255）。\n"
+                "先补光或调高曝光再重拍。")
+    if bright > 0.30:
+        return (f"没找到方形件的外轮廓：画面过曝（亮像素 {bright * 100:.1f}%）。\n"
+                "降低曝光或减少直射反光再重拍。")
+    return ("没找到方形件的外轮廓。检查：对焦、光照、零件是否完整在画面内、"
+            "背景是否干净（不要让背景里的大块阴影比零件更像矩形）。")
+
+
+def measure_rect(img: np.ndarray, args) -> RectResult:
+    """方形/矩形件：四条边亚像素 → 对边距/四边长/对角 → 换算 → 落盘。"""
+    res = concentric.list_rect(img)
+    if not res.get("ok"):
+        raise MeasureError(_rect_fail_message(img, res))
+
+    a_px = float(res["side_a_px"])
+    b_px = float(res["side_b_px"])
+    lines: list = []
+    warnings: list = []
+
+    def _p(s=""):
+        lines.append(s)
+
+    timestamp = datetime.now()
+    src_desc = args.image or "相机现拍"
+    t_mm, t_src, _ = resolve_thickness(args)
+    ratio, ratio_src, hinfo = resolve_ratio(args, a_px, t_mm, what="长边")
+    a_mm = None if ratio is None else a_px * ratio
+    b_mm = None if ratio is None else b_px * ratio
+    side_lengths = list(res["side_lengths"])
+    side_lengths_mm = ([] if ratio is None
+                       else [v * ratio for v in side_lengths])
+
+    warnings.extend(res.get("warnings") or [])
+    rectness = float(res.get("rectness") or 0.0)
+    thresh = float(res.get("thresh") or 0.0)
+    if 0.0 < rectness < 0.95:
+        warnings.append(f"矩形度偏低（{rectness:.3f}）：轮廓可能带阴影/缺口/圆角过大")
+
+    _p("\n===== 测量报告 =====")
+    _p(f"时间: {timestamp.strftime('%Y-%m-%d %H:%M:%S')}    图像: {src_desc}")
+    _p("模式: 方形件（四条边；**不命名**——哪条边是哪个名义尺寸，"
+       "由人对着标注图和图纸判断）")
+    _p(f"轮廓: 阈值 {thresh:.0f}，矩形度 {rectness:.3f}"
+       "（圆≈0.785、矩形≈0.99；低于 "
+       f"{fit_ellipse_ring.RECT_RECTANGULARITY:.2f} 不会走方形模式）")
+
+    if ratio is None:
+        _p(f"换算系数: 无 —— {ratio_src}")
+        _p("        没有系数就**只报像素、不给毫米**（拿别的机位的系数印毫米数是错的）")
+        warnings.append("机位没标定过，本次只给像素；用 --ref-mm（方形=长边真值）标定后才有毫米")
+    else:
+        unc = load_rig().get("uncertainty", "")
+        _p(f"换算系数: {ratio:.6f} mm/px （来源: {ratio_src}）"
+           + (f"  不确定度 {unc}" if unc else ""))
+        if getattr(args, "ref_mm", None) is not None:
+            _p("        方形模式的 --ref-mm 指**长边真值**（对边距 A），不是短边，也不是对角线")
+
+    if t_mm is not None:
+        _p(f"厚度: {t_mm:.2f} mm（来源: {t_src}）")
+    if hinfo["applied"] and ratio is not None:
+        base = float(hinfo["base"])
+        pct = (float(hinfo["factor"]) - 1.0) * 100.0
+        _p(f"高度补偿: 基准 {float(hinfo['t_ref']):.2f} mm，"
+           f"{float(hinfo['scale']) * 100:+.3f}%/mm → "
+           f"{base:.6f} → {ratio:.6f} mm/px（{pct:+.2f}%）")
+        _p("    假定零件直接坐在同一基准台面上（有垫块时量的是顶面高度）；"
+           "残余约 ±0.17% 是取边带，不是厚度误差")
+    elif hinfo["enabled"] and hinfo["note"]:
+        _p(f"高度补偿: 未做 —— {hinfo['note']}")
+        warnings.append(hinfo["note"])
+
+    _p(f"\n检出 4 条边（按轮廓顺时针编号，不命名）：")
+    for s in res["sides"]:
+        L = float(s.get("length_px") or s["coarse_len_px"])
+        mm = "" if ratio is None else f"  {L * ratio:8.3f} mm"
+        _p(f"  S{s['idx']:<2d} {L:9.1f} px{mm}  "
+           f"角 {s['angle_deg']:+6.2f}°  点 {s['n_inlier']}/{s['n']}  "
+           f"残差 {s['resid_px']:.2f}px  落差 {s['step']:.0f}  梯度 {s['grad_med']:.1f}")
+
+    _p(f"\n对边距 A（长边）: {a_px:.2f} px"
+       + ("" if a_mm is None else f"  = {a_mm:.3f} mm"))
+    _p(f"对边距 B（短边）: {b_px:.2f} px"
+       + ("" if b_mm is None else f"  = {b_mm:.3f} mm"))
+    if side_lengths_mm:
+        pairs = "  ".join(f"S{i + 1}={v:.3f}" for i, v in enumerate(side_lengths_mm))
+        _p(f"四条边长（直边延长到虚拟角点）: "
+           + "  ".join(f"S{i + 1}={v:.2f}px" for i, v in enumerate(side_lengths))
+           + f"\n                    = {pairs} mm")
+    else:
+        _p("四条边长（直边延长到虚拟角点）: "
+           + "  ".join(f"S{i + 1}={v:.2f}px" for i, v in enumerate(side_lengths)))
+    _p(f"对角线: {res['diagonals'][0]:.2f} / {res['diagonals'][1]:.2f} px，"
+       f"差 {res['diag_diff_px']:.2f}px（{res['diag_diff_pct']:.2f}%）")
+    _p(f"平行偏差: A {res['parallel_dev'][0]:.3f}° / B {res['parallel_dev'][1]:.3f}°"
+       f"    垂直偏差: 最大 {max(abs(v) for v in res['perp_dev']):.3f}°")
+    if abs(res["aspect"] - 1.0) <= 0.02:
+        _p(f"对边距比 A/B: {res['aspect']:.4f}（接近 1 → 方形件）")
+    else:
+        _p(f"对边距比 A/B: {res['aspect']:.4f}（矩形件；这是长宽比，不是缺陷）")
+
+    if warnings:
+        _p("\n⚠️  告警：")
+        for w in warnings:
+            _p(f"  - {w}")
+    if ratio is not None:
+        _p(f"\n提示: 单像素量化误差 = {ratio:.3f} mm；方形件的边同样是"
+           "'有厚度的带'（倒角/圆角），跨零件比较的精度天花板仍是 ±1.4%；"
+           "同一件重复性要好得多")
+
+    # ---- 标注图 + 报告落盘 ----
+    dbg = annotate.draw_rect(img, res, ratio)
+    DEBUG_DIR.mkdir(exist_ok=True)
+    dbg_path = DEBUG_DIR / "measure_rect_debug.jpg"
+    ok, buf = cv2.imencode(".jpg", dbg)
+    if ok:
+        try:
+            buf.tofile(str(dbg_path))       # 中文路径安全；imwrite 会静默失败
+        except OSError:
+            warnings.append("标注图写失败（debug/ 不可写？）")
+    else:
+        warnings.append("标注图编码失败")
+    _p(f"标注图: {dbg_path}")
+
+    rep_path = DEBUG_DIR / f"报告_{timestamp.strftime('%Y%m%d_%H%M%S')}.txt"
+    rep_path.write_text("\n".join(lines), encoding="utf-8")
+
+    return RectResult(
+        src_desc=src_desc, timestamp=timestamp, ratio=ratio, ratio_src=ratio_src,
+        side_a_px=a_px, side_b_px=b_px, side_a_mm=a_mm, side_b_mm=b_mm,
+        side_lengths=side_lengths, side_lengths_mm=side_lengths_mm,
+        diagonals=list(res["diagonals"]), diag_diff_px=float(res["diag_diff_px"]),
+        diag_diff_pct=float(res["diag_diff_pct"]), aspect=float(res["aspect"]),
+        angle=float(res["angle"]), parallel_dev=list(res["parallel_dev"]),
+        perp_dev=list(res["perp_dev"]), sides=list(res["sides"]),
+        center=tuple(res["center"]), thresh=thresh, rectness=rectness,
+        thickness_mm=t_mm, thickness_src=t_src,
+        ratio_base=hinfo.get("base"), height_factor=float(hinfo.get("factor", 1.0)),
+        height_applied=bool(hinfo.get("applied")), height_note=hinfo.get("note", ""),
+        warnings=warnings, lines=lines,
         debug_jpg=dbg_path, report_txt=rep_path, debug_img=dbg,
     )
 
 
 def main():
     args = build_parser().parse_args()
+    # 参数放错模式时不静默忽略：它们都会写档案/改变读数，静默最危险。
+    if args.mode == "thickness" and args.ref_mm is not None:
+        raise SystemExit("--ref-mm 是顶视机位标定，不能和 --mode thickness 一起用")
+    if args.mode == "thickness" and args.thickness is not None:
+        raise SystemExit("--thickness 用于外径测量的高度补偿，不用于 --mode thickness")
+    if args.mode != "thickness" and args.side_ref_mm is not None:
+        raise SystemExit("--side-ref-mm 只能配合 --mode thickness 使用")
+    if args.shape == "rect" and args.mode == "thickness":
+        raise SystemExit("--shape rect 不能和 --mode thickness 一起用"
+                         "（厚度是同一台相机换侧视镜头的另一条测量）")
+    if args.shape == "rect" and args.all_edges:
+        raise SystemExit("--all-edges 只用于圆形模式（方形件固定就是那四条边）")
     try:
+        if args.mode == "thickness":
+            run_thickness_mode(args)
+            return
         img = grab_image(args)
-        result = measure(img, args)
+        result = measure_rect(img, args) if args.shape == "rect" else measure(img, args)
     except MeasureError as e:
         raise SystemExit(str(e)) from None
     for ln in result.lines:

@@ -16,14 +16,26 @@
   "uncertainty": "±1.4%",
   "height_model": {
     "_说明": [
-      "零件厚度/顶面高度对 mm/px 的线性修正。默认 enabled=false，不参与任何计算；",
-      "等实时厚度测量就位后再启用。启用后：s(t) = mm_per_px × (1 + scale_per_mm × (t - thickness_ref_mm))。",
+      "零件厚度/顶面高度对 mm/px 的线性修正。2026-11-03 起 enabled=true：",
+      "只有拿到厚度时才生效（--thickness 或 debug/thickness_latest.json），拿不到就只报基准系数并告警。",
+      "s(t) = mm_per_px × (1 + scale_per_mm × (t - thickness_ref_mm))。",
       "符号：顶面越高（越靠近镜头），真实 mm/px 越小，所以 scale_per_mm 是负数。"
     ],
-    "enabled": false,
+    "enabled": true,
     "thickness_ref_mm": 14.4,
     "scale_per_mm": -0.0017,
-    "_依据": "2026-11-03 实测：126mm 件（厚 6.5mm）垫高 9mm，外缘 2855.5→2899.2px（+1.53%），垫后读 126.341mm（真值 126.3）；k=0.170%/mm。",
-    "_前提": "所有零件坐同一台面/工装；厚度只是顶面高度的代理量。垫高后轴比 >1.03 视为倾斜，数据作废。"
+    "_依据": "2026-11-03 实测：126mm 件（厚 6.5mm）垫高 9mm，外缘 2855.5→2899.2px（+1.53%），垫后读 126.341mm（真值 126.3）；k=0.170%/mm。按此参数 126mm@6.5 读 126.11（见 docs/设计决策记录.md §16）。",
+    "_前提": "所有零件坐同一台面/工装；厚度只是顶面高度的代理量。垫高后轴比 >1.03 视为倾斜，数据作废。",
+    "side": {
+      "_说明": [
+        "侧视厚度专用（同一台相机换 0.3x 远心镜头）。与上面的 mm_per_px（顶视）不是同一个数，别混用。",
+        "标定：python src\\measure_ring.py --mode thickness --side-ref-mm <量块真值mm>（用量块，不许用标称直径）。",
+        "offset_mm：用同族零件的卡尺真值吸收外缘倒角/取边偏置，默认 0。"
+      ],
+      "mm_per_px": null,
+      "offset_mm": 0.0,
+      "calibrated_at": null,
+      "from": ""
+    }
   }
 }

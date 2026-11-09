@@ -15,6 +15,9 @@ vision-roughness/data/captures/*
 # 例外：AGENTS.md §3 的两张回归夹具（2026-10-23 在固定机位重拍）必须入库
 !vision-roughness/data/captures/capture_20261023_032001.jpg
 !vision-roughness/data/captures/capture_20261023_032617.jpg
+# 例外：方形件回归夹具（2026-11-04 合成，900px 正方形 / 转 4.3° / σ=2 模糊）。
+# 合成图没有真实零件，只用于钉几何 px；mm 不作为真值。
+!vision-roughness/data/captures/fixture_rect_900px.jpg
 # temp/ 下只保留排查脚本 hik_debug.py，其余忽略
 **/temp/*
 !**/temp/hik_debug.py
