@@ -42,6 +42,8 @@ HOLE_MIN_POINTS = 36        # < 0.5×72 => 边界失败
 HOLE_LOW_POINTS = 43        # < 0.6×72 => 低置信度
 HOLE_MIN_CONTRAST = 15.0    # 暗/亮平台差 < 此值 => 该射线丢弃
 HOLE_MIN_GRAD = 1.0         # 上升沿最大梯度门槛（灰阶/样本）
+HOLE_INNER_MIN_GRAD = 0.7   # 螺孔内缘：上升沿最小梯度（螺纹/倒角过渡的噪声底）
+HOLE_INNER_MIN_POINTS = 15  # 内缘至少这么多条射线命中才算成功（有效射线通常 18~50）
 
 # 亮环（已装紧固件：螺钉头 / 沉孔口）。暗斑法在这类件上会把暗芯与暗影连成一个大斑，
 # 2026-11-03 实测：4 孔件在阈值 1.05~1.20 下亮环法都是恰好 4 个，暗斑法只有 3 个。
@@ -561,6 +563,68 @@ def fit_hole_boundary(sm, cx, cy, r_blob, max_r, n_ray=N_RAY,
     r0 = float(np.median(np.hypot(pts[:, 0] - cx, pts[:, 1] - cy)))
     ell, n = filter_and_fit(pts, cx, cy, r0)
     return ell, n, contrast
+
+
+def _fit_circle_robust(pts, cx, cy, r0, tol=0.15, min_pts=10):
+    """圆的鲁棒拟合：代数最小二乘 + 迭代收紧。
+
+    内缘是螺纹/渐变边，噪声大；`filter_and_fit` 的椭圆拟合会发散（实测 47 个点也拟不出）。
+    孔本身是圆，用圆拟合更稳。
+    """
+    p = np.asarray(pts, float).copy()
+    r = float(r0)
+    for _ in range(4):
+        d = np.hypot(p[:, 0] - cx, p[:, 1] - cy)
+        p = p[np.abs(d - r) <= max(r * tol, 4.0)]
+        if len(p) < min_pts:
+            return None, len(p)
+        A = np.c_[2 * p[:, 0], 2 * p[:, 1], np.ones(len(p))]
+        b = (p ** 2).sum(axis=1)
+        sol, *_ = np.linalg.lstsq(A, b, rcond=None)
+        cx, cy, c = sol
+        r = float(np.sqrt(max(c + cx * cx + cy * cy, 0.0)))
+    return (float(cx), float(cy), float(r)), len(p)
+
+
+def fit_hole_inner_boundary(sm, cx, cy, r_blob, n_ray=N_RAY):
+    """螺孔内缘：暗孔/螺纹外缘 -> 亮倒角的**第一条梯度峰**。
+
+    取 `[0.2, 0.7]×r_blob` 内的最大正梯度（螺纹/孔壁 → 亮倒角），抛物插值到亚像素，
+    再用**鲁棒圆拟合**（螺纹/渐变边噪声大，椭圆拟合会发散）。
+    实测 6 孔件：今天 3.16~3.29mm（中位 3.24），10-23 夹具 3.00~3.33（中位 3.26）——
+    **跨会话只差 0.02mm**；而倒角外缘是 4.7~5.0mm。
+
+    返回 `(((cx,cy),(2r,2r),0) | None, 点数, 对比度中位)`。
+    """
+    pts, contrasts = [], []
+    for k in range(n_ray):
+        ang = 2 * np.pi * k / n_ray
+        d, g = ray_profile(sm, cx, cy, ang, 0.8 * r_blob)
+        m = (d >= 0.2 * r_blob) & (d <= 0.7 * r_blob)
+        di, gi = d[m], g[m]
+        if len(gi) < 6:
+            continue
+        gr = np.gradient(gi)
+        j = int(np.argmax(gr))
+        if gr[j] < HOLE_INNER_MIN_GRAD or j == 0 or j >= len(gi) - 1:
+            continue
+        a_, b_, c_ = gr[j - 1], gr[j], gr[j + 1]
+        denom = a_ - 2 * b_ + c_
+        delta = 0.5 * (a_ - c_) / denom if denom != 0 else 0.0
+        rr = di[j] + 0.5 * delta
+        pts.append((cx + np.cos(ang) * rr, cy + np.sin(ang) * rr))
+        contrasts.append(abs(float(gr[j])))
+
+    pts = np.asarray(pts, float)
+    contrast = float(np.median(contrasts)) if contrasts else 0.0
+    if len(pts) < HOLE_INNER_MIN_POINTS:
+        return None, len(pts), contrast
+    r0 = float(np.median(np.hypot(pts[:, 0] - cx, pts[:, 1] - cy)))
+    got, n = _fit_circle_robust(pts, cx, cy, r0)
+    if got is None:
+        return None, n, contrast
+    ecx, ecy, er = got
+    return ((ecx, ecy), (2 * er, 2 * er), 0.0), n, contrast
 
 
 def validate_equidistant_circle(cands, ocx, ocy, ang_tol=5.0, r_tol=0.05,

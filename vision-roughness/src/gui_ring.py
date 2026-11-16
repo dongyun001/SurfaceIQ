@@ -669,10 +669,14 @@ class MeasureWindow:
                     parts.append(f"H{h['idx']} {h['dia_px'] * r.ratio:.2f}")
                 else:
                     parts.append(f"H{h['idx']} {h['dia_px']:.0f}px")
-            kind = ("亮环" if any(h.get("boundary") == "bright_ring" for h in r.holes)
-                    else "暗斑")
+            if any(h.get("boundary") == "bright_ring" for h in r.holes):
+                kind = "亮环"
+            elif any(h.get("boundary") == "hole_inner" for h in r.holes):
+                kind = "螺孔内缘"
+            else:
+                kind = "暗斑"
             self.lbl_holes.config(
-                text=f"{'  '.join(parts)}\n{len(r.holes)} 孔 · {kind}边界",
+                text=f"{'  '.join(parts)}\n{len(r.holes)} 孔 · {kind}",
                 fg=COLOR_TEXT)
         else:
             self.lbl_holes.config(text=r.holes_note or "—", fg=COLOR_MUTED)

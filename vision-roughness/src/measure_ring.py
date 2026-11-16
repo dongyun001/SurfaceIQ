@@ -491,14 +491,20 @@ def measure_holes(img: np.ndarray, res: dict, ratio):
         c = cands[j]
         d_c = float(np.hypot(c["cx"] - ocx, c["cy"] - ocy))
         ang = float(np.degrees(np.arctan2(c["cy"] - ocy, c["cx"] - ocx)) % 360)
-        # 只作采样上限；逐射线的边界限制由 fit_hole_boundary 按方向算
-        # （孔常常紧挨环形槽，全局取"最近边"会把所有射线都砍掉）
+        # 倒角外缘：只作参考（用户要的是里面那条螺孔内缘，不是这个）
         max_r = min(2.6 * c["r"], 0.5 * r_outer)
-        ell, n, contrast = fit_ellipse_ring.fit_hole_boundary(
+        ell_out, _, _ = fit_ellipse_ring.fit_hole_boundary(
             sm, c["cx"], c["cy"], c["r"], max_r,
             edge_radii=edge_r, part_center=(ocx, ocy))
+        dia_out = 0.0 if ell_out is None else (ell_out[1][0] + ell_out[1][1]) / 2
+        # 螺孔内缘：螺纹/孔壁 -> 亮倒角的第一条梯度峰；r_ref 用倒角外缘的拟合半径
+        r_ref = (dia_out / 2) if dia_out > 0 else c["r"]
+        ell, n, contrast = fit_ellipse_ring.fit_hole_inner_boundary(
+            sm, c["cx"], c["cy"], r_ref)
+        boundary = "hole_inner"
         h = {"idx": i, "votes": int(c["votes"]), "circularity": float(c["circ"]),
-             "contrast": float(contrast), "boundary": "dark_blob"}
+             "contrast": float(contrast), "boundary": boundary,
+             "dia_outer_px": float(dia_out)}
         if ell is None:
             h.update({"cx": float(c["cx"]), "cy": float(c["cy"]), "r_norm": d_c / r_outer,
                       "angle_deg": ang, "dia_px": 0.0, "a1": 0.0, "a2": 0.0, "ang": 0.0,
@@ -511,8 +517,9 @@ def measure_holes(img: np.ndarray, res: dict, ratio):
                       "dia_px": float((ea1 + ea2) / 2), "a1": float(ea1), "a2": float(ea2),
                       "ang": float(eang), "n_points": int(n),
                       "aspect": float(max(ea1, ea2) / max(min(ea1, ea2), 1e-6)),
-                      "status": ("OK" if (n >= fit_ellipse_ring.HOLE_LOW_POINTS
-                                          and c["votes"] >= 4) else "低置信度")})
+                      "status": ("OK" if (n >= fit_ellipse_ring.HOLE_INNER_MIN_POINTS
+                                          and c["votes"] >= 4
+                                          and boundary == "hole_inner") else "低置信度")})
         holes.append(h)
 
     if verdict["kind"] == "equidistant_circle":
@@ -658,14 +665,22 @@ def measure(img: np.ndarray, args) -> RingResult:
             mark = "" if h["status"] == "OK" else f'  ⚠️ {h["status"]}'
             if h.get("boundary") == "bright_ring":
                 support, tag = f'轮廓点 {h["n_points"]}', "  亮环"
+            elif h.get("boundary") == "hole_inner":
+                support, tag = f'点 {h["n_points"]}/{fit_ellipse_ring.N_RAY}', "  内缘"
             else:
                 support, tag = f'点 {h["n_points"]}/{fit_ellipse_ring.N_RAY}', ""
+            extra = ""
+            if h.get("boundary") == "hole_inner" and h.get("dia_outer_px"):
+                cm = "" if ratio is None else f"={h['dia_outer_px'] * ratio:.2f}mm"
+                extra = f"  倒角口 {h['dia_outer_px']:.1f}px{cm}"
             _p(f'  H{h["idx"]:<3d} {h["dia_px"]:8.1f} px{mm}  '
                f'角{h["angle_deg"]:6.1f}°  d/R {h["r_norm"]:.3f}  '
-               f'[{support}  票 {h["votes"]}  轴比 {h["aspect"]:.2f}{tag}]{mark}')
+               f'[{support}  票 {h["votes"]}  轴比 {h["aspect"]:.2f}{tag}{extra}]{mark}')
         else:
+            co = (f'  倒角口 {h["dia_outer_px"]:.1f}px'
+                  if h.get("dia_outer_px") else "")
             _p(f'  H{h["idx"]:<3d} 边界失败（点 {h["n_points"]}）  '
-               f'角{h["angle_deg"]:6.1f}°  d/R {h["r_norm"]:.3f}')
+               f'角{h["angle_deg"]:6.1f}°  d/R {h["r_norm"]:.3f}{co}')
     dias = [h["dia_px"] for h in holes if h["dia_px"] > 0]
     if len(dias) >= 2:
         med = float(np.median(dias))
@@ -676,6 +691,8 @@ def measure(img: np.ndarray, args) -> RingResult:
     if holes:
         if any(h.get("boundary") == "bright_ring" for h in holes):
             _p("  提示：孔径取「亮环外轮廓」（螺钉头/沉孔口），不是通孔内壁；与暗斑孔的读数含义不同")
+        elif any(h.get("boundary") == "hole_inner" for h in holes):
+            _p("  提示：孔径取「螺孔内缘」（螺纹/孔壁 → 亮倒角的第一条上升沿），倒角口只作参考")
         else:
             _p("  提示：孔径取「梯度最大（steepest）」，与同心边同一套定义；孔和边一样有取边问题")
 
